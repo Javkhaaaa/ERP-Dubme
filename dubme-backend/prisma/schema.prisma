@@ -1,0 +1,109 @@
+// Prisma schema for dubme.mn
+// Postgres (Supabase). Run `prisma migrate dev --name init` after editing.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+/// One dubbing run from upload to final muxed video.
+model Job {
+  id              String    @id @default(uuid())
+  status          JobStatus @default(UPLOADED)
+  sourceLanguage  String    @default("zh") // ISO 639-1
+  targetLanguage  String    @default("mn")
+  /// Which TTS engine to use: "gemini" or "chimege"
+  ttsProvider     String    @default("gemini")
+  voiceName       String? // Gemini voice (e.g. "Kore") or Chimege voice (e.g. "FEMALE3v2")
+
+  /// What to produce: "dub" (replace audio via TTS) or "subtitle" (keep
+  /// original audio, only generate subtitles — no TTS).
+  outputMode      String    @default("dub")
+  /// Burn the subtitles onto the video (hardsub) in addition to the SRT file.
+  subtitleBurn    Boolean   @default(false)
+  /// Which text the subtitle shows: "translated" (mn), "source" (zh), or
+  /// "both" (source on top, translation below).
+  subtitleText    String    @default("translated")
+  /// Subtitle styling (applied when subtitleBurn=true).
+  subtitleFontSize  Int     @default(22)
+  subtitleTextColor String  @default("#FFFFFF")  // hex #RRGGBB
+  subtitleBgColor   String?                       // hex #RRGGBB, null = no background
+  subtitlePosition  String  @default("bottom")   // "top" | "middle" | "bottom"
+
+  // Storage object keys (Storj). Full URLs are derived in the service layer.
+  inputKey      String? // raw uploaded video
+  audioKey      String? // extracted audio (wav)
+  outputKey     String? // final muxed video
+  subtitleKey   String? // generated SRT
+
+  // Free-text style instructions passed through to Gemini TTS.
+  stylePrompt   String?
+  temperature   Float?  @default(1.0)
+
+  // Last error, if any.
+  errorMessage  String?
+
+  segments      Segment[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// One transcribed/translated/synthesized segment of a Job.
+/// Created after STT (sourceText), filled with translatedText after translation,
+/// and audioKey is set after TTS.
+model Segment {
+  id             String   @id @default(uuid())
+  jobId          String
+  job            Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  /// 0-based index within the job (preserves utterance order).
+  sequence       Int
+
+  /// In seconds, from the start of the source audio.
+  startSec       Float
+  endSec         Float
+
+  sourceText     String  @db.Text
+  translatedText String? @db.Text
+  audioKey       String?  // per-segment TTS WAV stored in Storj
+  audioDuration  Float?   // measured duration of synthesized clip
+
+  /// Detected emotion of the original speaker for this segment
+  /// (e.g. "neutral", "happy", "excited", "calm", "sad", "angry").
+  emotion        String?
+
+  /// Free-form TTS style hint generated alongside translation
+  /// (e.g. "Speak warmly and slowly", "Read with excitement").
+  style          String? @db.Text
+
+  /// True when human edited the translatedText after auto-translate.
+  edited         Boolean  @default(false)
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([jobId, sequence])
+  @@index([jobId])
+}
+
+enum JobStatus {
+  UPLOADED       // file in object storage, nothing else done
+  DOWNLOADING    // server-side fetching the input from a user-supplied URL
+  EXTRACTING     // ffmpeg pulling audio
+  TRANSCRIBING   // Groq Whisper → segments
+  TRANSLATING    // Gemini → mongol text
+  EDITING        // human review pause (optional)
+  SYNTHESIZING   // Gemini TTS → per-segment audio
+  MUXING         // ffmpeg combining audio + video
+  DONE
+  FAILED
+}
