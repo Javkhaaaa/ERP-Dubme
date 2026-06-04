@@ -3,10 +3,11 @@ import { config } from "../config.js";
 
 const genai = new GoogleGenAI({ apiKey: config.geminiApiKey });
 
-// Gemini 2.5 Pro — quality-first. Slower per call (~15-30s with thinking)
-// but materially better on low-resource targets like Mongolian: stricter
-// number-as-word compliance, more idiomatic phrasing, fewer hallucinated
-// transliterations. The cost is acceptable for non-realtime subtitle work.
+// Gemini 2.5 Pro — quality-first model. We keep it even though we disable
+// `thinking` below: Pro's base output is still meaningfully better than
+// Flash on low-resource targets like Mongolian (number-as-word compliance,
+// idiom adaptation, less hallucinated transliteration), and switching off
+// thinking trims ~3× off the per-call latency at minimal quality cost.
 const TRANSLATE_MODEL = "gemini-2.5-pro";
 
 // Long videos can produce 1000+ segments. Sending them all in one prompt
@@ -16,6 +17,12 @@ const TRANSLATE_MODEL = "gemini-2.5-pro";
 // terminology and tone stay consistent across batch boundaries.
 const BATCH_SIZE = 80;
 const CONTEXT_LINES = 6;
+// Concurrent batches per "wave". Each wave runs in parallel, then we wait
+// for the wave to finish before starting the next — so wave-N batches still
+// get sliding context from the end of wave-(N-1)'s translations. Trade-off:
+// within a wave, batches don't see each other's terminology choices, but the
+// refine step can paper over any drift and the 4× speedup is worth it.
+const PARALLEL_BATCHES = 4;
 
 /**
  * Translate every segment text to the target language. Internally batches
@@ -31,31 +38,49 @@ export async function translateSegments(
 
   const results: string[] = new Array(texts.length).fill("");
 
-  for (let start = 0; start < texts.length; start += BATCH_SIZE) {
-    const end = Math.min(start + BATCH_SIZE, texts.length);
-    const batchTexts = texts.slice(start, end);
+  // Collect every batch's starting index up front so we can group them
+  // into parallel waves.
+  const batchStarts: number[] = [];
+  for (let s = 0; s < texts.length; s += BATCH_SIZE) batchStarts.push(s);
+  const totalBatches = batchStarts.length;
 
-    // Pull carry-over from the previous already-translated lines for
-    // continuity (recurring names, register, established terminology).
-    const ctxFrom = Math.max(0, start - CONTEXT_LINES);
-    const ctxSources = texts.slice(ctxFrom, start);
-    const ctxTranslations = results.slice(ctxFrom, start);
-
-    const batchOut = await translateBatch(
-      batchTexts,
-      ctxSources,
-      ctxTranslations,
-      sourceLanguage,
-      targetLanguage,
-      texts.length,
-      start,
+  for (
+    let waveIdx = 0;
+    waveIdx < totalBatches;
+    waveIdx += PARALLEL_BATCHES
+  ) {
+    const wave = batchStarts.slice(waveIdx, waveIdx + PARALLEL_BATCHES);
+    const waveOutputs = await Promise.all(
+      wave.map((start) => {
+        const end = Math.min(start + BATCH_SIZE, texts.length);
+        const batchTexts = texts.slice(start, end);
+        // Context only flows from PRIOR waves' results — batches within the
+        // same wave can't see each other (they're inflight in parallel).
+        const ctxFrom = Math.max(0, start - CONTEXT_LINES);
+        const ctxSources = texts.slice(ctxFrom, start);
+        const ctxTranslations = results.slice(ctxFrom, start);
+        return translateBatch(
+          batchTexts,
+          ctxSources,
+          ctxTranslations,
+          sourceLanguage,
+          targetLanguage,
+          texts.length,
+          start,
+        );
+      }),
     );
-    for (let i = 0; i < batchOut.length; i++) {
-      results[start + i] = batchOut[i];
-    }
-
+    // Splice the wave's outputs back into the results array.
+    wave.forEach((start, i) => {
+      const out = waveOutputs[i];
+      for (let j = 0; j < out.length; j++) {
+        results[start + j] = out[j];
+      }
+    });
+    const waveEnd = Math.min(waveIdx + PARALLEL_BATCHES, totalBatches);
     console.log(
-      `[translate] batch ${start + 1}-${end}/${texts.length} done`,
+      `[translate] wave ${Math.floor(waveIdx / PARALLEL_BATCHES) + 1} done — ` +
+        `${waveEnd}/${totalBatches} batches complete`,
     );
   }
 
@@ -142,34 +167,48 @@ export async function refineSegments(
 
   const results: string[] = new Array(sourceTexts.length).fill("");
 
-  for (let start = 0; start < sourceTexts.length; start += BATCH_SIZE) {
-    const end = Math.min(start + BATCH_SIZE, sourceTexts.length);
-    const batchSources = sourceTexts.slice(start, end);
-    const batchCurrents = currentTranslations.slice(start, end);
+  const batchStarts: number[] = [];
+  for (let s = 0; s < sourceTexts.length; s += BATCH_SIZE) batchStarts.push(s);
+  const totalBatches = batchStarts.length;
 
-    // Carry over the just-refined lines from the previous batch so the new
-    // style/tone choices stay consistent across batch boundaries.
-    const ctxFrom = Math.max(0, start - CONTEXT_LINES);
-    const ctxSources = sourceTexts.slice(ctxFrom, start);
-    const ctxRefined = results.slice(ctxFrom, start);
-
-    const batchOut = await refineBatch(
-      batchSources,
-      batchCurrents,
-      ctxSources,
-      ctxRefined,
-      sourceLanguage,
-      targetLanguage,
-      styleInstruction,
-      sourceTexts.length,
-      start,
+  for (
+    let waveIdx = 0;
+    waveIdx < totalBatches;
+    waveIdx += PARALLEL_BATCHES
+  ) {
+    const wave = batchStarts.slice(waveIdx, waveIdx + PARALLEL_BATCHES);
+    const waveOutputs = await Promise.all(
+      wave.map((start) => {
+        const end = Math.min(start + BATCH_SIZE, sourceTexts.length);
+        const batchSources = sourceTexts.slice(start, end);
+        const batchCurrents = currentTranslations.slice(start, end);
+        // Carry over from the prior wave's already-refined lines.
+        const ctxFrom = Math.max(0, start - CONTEXT_LINES);
+        const ctxSources = sourceTexts.slice(ctxFrom, start);
+        const ctxRefined = results.slice(ctxFrom, start);
+        return refineBatch(
+          batchSources,
+          batchCurrents,
+          ctxSources,
+          ctxRefined,
+          sourceLanguage,
+          targetLanguage,
+          styleInstruction,
+          sourceTexts.length,
+          start,
+        );
+      }),
     );
-    for (let i = 0; i < batchOut.length; i++) {
-      results[start + i] = batchOut[i];
-    }
-
+    wave.forEach((start, i) => {
+      const out = waveOutputs[i];
+      for (let j = 0; j < out.length; j++) {
+        results[start + j] = out[j];
+      }
+    });
+    const waveEnd = Math.min(waveIdx + PARALLEL_BATCHES, totalBatches);
     console.log(
-      `[refine] batch ${start + 1}-${end}/${sourceTexts.length} done`,
+      `[refine] wave ${Math.floor(waveIdx / PARALLEL_BATCHES) + 1} done — ` +
+        `${waveEnd}/${totalBatches} batches complete`,
     );
   }
 
@@ -263,10 +302,11 @@ async function callWithRetry(prompt: string): Promise<string> {
           // little stochasticity lets Pro pick more natural phrasings over
           // its most-probable (often literal) first guess.
           temperature: 0.4,
-          // Pro's "thinking" stays enabled (no thinkingBudget=0 cap). For
-          // low-resource targets like Mongolian, the internal deliberation
-          // measurably improves number-as-word compliance and idiom adaptation.
-          // Per-batch latency is ~15-30s, acceptable for non-realtime dubbing.
+          // thinking off — Pro's deliberation adds 15-30s/batch for
+          // negligible quality gain on subtitle translation. With it off
+          // each batch returns in ~5-10s; combined with parallel waves
+          // below this brings a 2hr video from ~10min to ~1min total.
+          thinkingConfig: { thinkingBudget: 0 },
         },
       });
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
