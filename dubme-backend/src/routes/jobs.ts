@@ -73,8 +73,13 @@ const StartRenderSchema = z.object({
     .regex(/^#[0-9A-Fa-f]{6}$/)
     .nullable()
     .optional(),
-  /** Vertical position. */
+  /**
+   * Legacy 3-option position. Still accepted for compatibility but ignored
+   * when subtitlePositionPct is provided.
+   */
   subtitlePosition: z.enum(["top", "middle", "bottom"]).default("bottom"),
+  /** Vertical position 0-100% from top of frame. */
+  subtitlePositionPct: z.number().int().min(0).max(100).default(88),
 });
 
 export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
@@ -384,6 +389,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
         subtitleTextColor: body.subtitleTextColor,
         subtitleBgColor: body.subtitleBgColor ?? null,
         subtitlePosition: body.subtitlePosition,
+        subtitlePositionPct: body.subtitlePositionPct,
       },
     });
 

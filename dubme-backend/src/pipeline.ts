@@ -313,9 +313,7 @@ export async function runRender(jobId: string): Promise<void> {
     fontSize: job.subtitleFontSize ?? 22,
     textColor: job.subtitleTextColor ?? "#FFFFFF",
     bgColor: job.subtitleBgColor ?? null,
-    position:
-      (job.subtitlePosition as "top" | "middle" | "bottom" | undefined) ??
-      "bottom",
+    positionPct: job.subtitlePositionPct ?? 88,
   };
 
   const segments = await prisma.segment.findMany({

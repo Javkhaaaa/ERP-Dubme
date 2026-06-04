@@ -219,6 +219,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const [subtitleBgColor, setSubtitleBgColor] = useState<string | null>(null);
   const [subtitlePosition, setSubtitlePosition] =
     useState<SubtitlePosition>("bottom");
+  // Continuous vertical position: 0 = top of frame, 100 = bottom. Default
+  // 88 matches the classic "lower-third subtitle" placement.
+  const [subtitlePositionPct, setSubtitlePositionPct] = useState(88);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const [previewActiveSeg, setPreviewActiveSeg] = useState<Segment | null>(null);
   const [refinePresetId, setRefinePresetId] = useState<string>(REFINE_PRESETS[0].id);
@@ -434,6 +437,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
         subtitleTextColor,
         subtitleBgColor,
         subtitlePosition,
+        subtitlePositionPct,
         ...(outputMode === "dub"
           ? { voiceName: voice, ttsProvider, stylePrompt: stylePrompt || undefined }
           : {}),
@@ -578,7 +582,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
                   fontSize={subtitleFontSize}
                   textColor={subtitleTextColor}
                   bgColor={subtitleBgColor}
-                  position={subtitlePosition}
+                  positionPct={subtitlePositionPct}
+                  onPositionChange={setSubtitlePositionPct}
                 />
               )}
             </div>
@@ -1103,17 +1108,31 @@ export default function JobPage({ params }: { params: { id: string } }) {
                   </label>
 
                   <label>
-                    <span>Байрлал</span>
-                    <select
-                      value={subtitlePosition}
+                    <span>
+                      Босоо байрлал ({subtitlePositionPct}% — дээр 0 ↔ 100 доор)
+                    </span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={subtitlePositionPct}
                       onChange={(e) =>
-                        setSubtitlePosition(e.target.value as SubtitlePosition)
+                        setSubtitlePositionPct(Number(e.target.value))
                       }
+                      style={{ width: "100%" }}
+                    />
+                    <span
+                      className="muted"
+                      style={{
+                        display: "block",
+                        fontSize: "0.75rem",
+                        marginTop: "0.25rem",
+                      }}
                     >
-                      <option value="bottom">Доор (анхдагч)</option>
-                      <option value="middle">Дунд</option>
-                      <option value="top">Дээр</option>
-                    </select>
+                      Preview видеон дээрх хадмалыг хулганаар дээш доош зөөж
+                      ч болно.
+                    </span>
                   </label>
                 </>
               )}
@@ -1188,6 +1207,10 @@ function formatTime(sec: number): string {
  * subtitle will look. Text comes from whatever segment is active at the
  * current playback time; if none, a static sample is shown so the user can
  * still see styling changes when the video is paused.
+ *
+ * The overlay is draggable vertically — mouse-down + drag updates
+ * `positionPct` (0-100% from top of video) so the user can position the
+ * subtitle by feel rather than only via the slider.
  */
 function SubtitlePreviewOverlay({
   activeSegment,
@@ -1195,14 +1218,16 @@ function SubtitlePreviewOverlay({
   fontSize,
   textColor,
   bgColor,
-  position,
+  positionPct,
+  onPositionChange,
 }: {
   activeSegment: Segment | null;
   subtitleText: SubtitleText;
   fontSize: number;
   textColor: string;
   bgColor: string | null;
-  position: SubtitlePosition;
+  positionPct: number;
+  onPositionChange: (pct: number) => void;
 }) {
   const fallbackSource = "示例字幕";
   const fallbackTranslated = "Энэ бол жишээ хадмал";
@@ -1217,31 +1242,69 @@ function SubtitlePreviewOverlay({
         ? [source, translated]
         : [translated];
 
-  // Position math — match libass alignment 2 (bottom-center) / 5 (middle) / 8 (top).
-  const vertical: React.CSSProperties =
-    position === "top"
-      ? { top: "5%" }
-      : position === "middle"
-        ? { top: "50%", transform: "translateY(-50%)" }
-        : { bottom: "6%" };
-
   // No-background mode → simulate libass outline via multi-direction text-shadow.
   const outlineShadow =
     "1px 1px 2px rgba(0,0,0,0.95), -1px 1px 2px rgba(0,0,0,0.95), " +
     "1px -1px 2px rgba(0,0,0,0.95), -1px -1px 2px rgba(0,0,0,0.95), " +
     "0 0 4px rgba(0,0,0,0.6)";
 
+  const [dragging, setDragging] = useState(false);
+
+  // Convert a clientY position (during drag) to a 0-100 percentage relative
+  // to the parent video container. We pull the parent from the event target's
+  // ancestor — works regardless of video size / window scroll.
+  const updateFromEvent = (
+    clientY: number,
+    container: HTMLElement | null,
+  ) => {
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    if (rect.height === 0) return;
+    const raw = ((clientY - rect.top) / rect.height) * 100;
+    const clamped = Math.max(0, Math.min(100, Math.round(raw)));
+    onPositionChange(clamped);
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragging(true);
+    const container = e.currentTarget.parentElement;
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    updateFromEvent(e.clientY, container);
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    updateFromEvent(e.clientY, e.currentTarget.parentElement);
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    setDragging(false);
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+  };
+
   return (
     <div
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
       style={{
         position: "absolute",
         left: 0,
         right: 0,
+        top: `${positionPct}%`,
+        transform: "translateY(-50%)",
         textAlign: "center",
-        pointerEvents: "none",
         padding: "0 4%",
-        ...vertical,
+        cursor: dragging ? "grabbing" : "grab",
+        userSelect: "none",
+        touchAction: "none",
+        // While not dragging, allow clicks to pass through to the video so
+        // play/pause works as usual. Drag flips to grab and captures pointer.
+        pointerEvents: "auto",
       }}
+      title="Хулганаар дээш доош чирж зөөнө үү"
     >
       <span
         style={{
@@ -1257,6 +1320,10 @@ function SubtitlePreviewOverlay({
           textShadow: bgColor ? "none" : outlineShadow,
           whiteSpace: "pre-line",
           maxWidth: "92%",
+          outline: dragging
+            ? "1px dashed rgba(124, 92, 255, 0.6)"
+            : "none",
+          outlineOffset: 4,
         }}
       >
         {lines.join("\n")}

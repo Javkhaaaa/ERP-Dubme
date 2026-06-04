@@ -33,7 +33,10 @@ model Job {
   subtitleFontSize  Int     @default(22)
   subtitleTextColor String  @default("#FFFFFF")  // hex #RRGGBB
   subtitleBgColor   String?                       // hex #RRGGBB, null = no background
-  subtitlePosition  String  @default("bottom")   // "top" | "middle" | "bottom"
+  subtitlePosition  String  @default("bottom")   // legacy: "top" | "middle" | "bottom" — kept for backwards compat, no longer read
+  /// 0 = top of frame, 100 = bottom. Default 88 places the subtitle in the
+  /// standard lower-third area. Replaces subtitlePosition.
+  subtitlePositionPct Int   @default(88)
 
   // Storage object keys (Storj). Full URLs are derived in the service layer.
   inputKey      String? // raw uploaded video

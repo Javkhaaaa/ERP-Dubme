@@ -117,6 +117,23 @@ export function probeDuration(path: string): Promise<number> {
 }
 
 /**
+ * Read the video stream's pixel height. Needed by the burn step to convert a
+ * percentage-based vertical position (0-100 from top) into the ASS MarginV
+ * pixel value libass actually consumes. Falls back to 1080 if no video
+ * stream is found (defensive — shouldn't happen for real input).
+ */
+export function probeVideoHeight(path: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(path, (err, data) => {
+      if (err) return reject(err);
+      const v = data.streams.find((s) => s.codec_type === "video");
+      const h = typeof v?.height === "number" ? v.height : 1080;
+      resolve(h || 1080);
+    });
+  });
+}
+
+/**
  * Trim leading + trailing silence from a TTS clip and write the cleaned
  * version to a new file. Returns the new path AND its true duration so
  * downstream timing math uses the real playable length, not the noisy
@@ -393,15 +410,19 @@ export interface BurnSubtitleStyle {
   textColor: string;
   /** Hex "#RRGGBB" or null — null draws an outline only (no fill box). */
   bgColor: string | null;
-  /** Vertical position on screen. */
-  position: "top" | "middle" | "bottom";
+  /**
+   * Vertical position as a percentage from the TOP of the frame.
+   * 0   = text at top edge, 88 = standard lower-third area, 100 = bottom edge.
+   * Converted to ASS MarginV in pixels using the video's actual height.
+   */
+  positionPct: number;
 }
 
 const DEFAULT_BURN_STYLE: BurnSubtitleStyle = {
   fontSize: 22,
   textColor: "#FFFFFF",
   bgColor: null,
-  position: "bottom",
+  positionPct: 88,
 };
 
 /**
@@ -418,7 +439,10 @@ function hexToAssColor(hex: string, alpha = 0): string {
   return `&H${aa}${b}${g}${r}`.toUpperCase();
 }
 
-function buildForceStyle(style: BurnSubtitleStyle): string {
+function buildForceStyle(
+  style: BurnSubtitleStyle,
+  videoHeight: number,
+): string {
   const primary = hexToAssColor(style.textColor, 0);
   const outline = "&H80000000"; // ~50% transparent black outline — always
   const back = style.bgColor
@@ -428,8 +452,11 @@ function buildForceStyle(style: BurnSubtitleStyle): string {
   // when the user actually chose a background colour keeps the default
   // "floating outlined text" look intact.
   const borderStyle = style.bgColor ? 3 : 1;
-  const alignment = { top: 8, middle: 5, bottom: 2 }[style.position];
-  const marginV = style.position === "bottom" ? 28 : 16;
+  // Bottom-center anchor + MarginV measured from the bottom edge gives us a
+  // simple linear mapping from percentage to pixels. Clamp pct into [0,100]
+  // so a stray slider value can't push the text off-screen.
+  const pct = Math.max(0, Math.min(100, style.positionPct));
+  const marginV = Math.round(((100 - pct) / 100) * videoHeight);
   return [
     `FontSize=${style.fontSize}`,
     `PrimaryColour=${primary}`,
@@ -438,7 +465,7 @@ function buildForceStyle(style: BurnSubtitleStyle): string {
     `BorderStyle=${borderStyle}`,
     `Outline=2`,
     `Shadow=0`,
-    `Alignment=${alignment}`,
+    `Alignment=2`, // bottom-center is the most predictable anchor
     `MarginV=${marginV}`,
   ].join(",");
 }
@@ -460,9 +487,12 @@ export async function burnSubtitles(
   // the filter string, so any such char in the path must be escaped. Our tmp
   // paths never contain them, but escape defensively.
   const escapedPath = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+  // Probe the video's actual height so positionPct (0-100%) lands at the
+  // same visual spot regardless of source resolution (720p vs 1080p vs 4K).
+  const videoHeight = await probeVideoHeight(videoPath);
   // FontName is intentionally omitted so libass/fontconfig picks a font with
   // the right glyph coverage (Cyrillic for Mongolian, CJK for Chinese).
-  const forceStyle = buildForceStyle(style);
+  const forceStyle = buildForceStyle(style, videoHeight);
   const vf = `subtitles=${escapedPath}:force_style='${forceStyle}'`;
   return runFfmpeg([
     "-y",

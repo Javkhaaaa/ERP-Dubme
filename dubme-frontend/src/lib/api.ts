@@ -33,6 +33,7 @@ export interface Job {
   subtitleTextColor: string;
   subtitleBgColor: string | null;
   subtitlePosition: SubtitlePosition;
+  subtitlePositionPct: number;
   inputKey: string | null;
   outputKey: string | null;
   subtitleKey: string | null;
@@ -213,6 +214,8 @@ export interface RenderOptions {
   subtitleTextColor?: string;
   subtitleBgColor?: string | null;
   subtitlePosition?: SubtitlePosition;
+  /** 0-100, vertical position as % from top of frame. Default 88. */
+  subtitlePositionPct?: number;
   /** Required only when outputMode === "dub". */
   voiceName?: string;
   ttsProvider?: "gemini" | "chimege";
