@@ -170,6 +170,22 @@ export async function createJobFromSrtUpload(
   });
 }
 
+/**
+ * Translate-only: SRT in source language → translated SRT, no video at all.
+ * Server creates a job with inputKey=null, populates segments from the SRT,
+ * runs translate, lands in EDITING. User edits + downloads the translated
+ * SRT from the in-editor bar. No render step is possible/needed.
+ */
+export async function createJobFromSrtOnly(
+  srtContent: string,
+  sourceLanguage = "zh",
+): Promise<{ jobId: string; segmentCount: number }> {
+  return api("/api/jobs/from-srt-only", {
+    method: "POST",
+    body: JSON.stringify({ srtContent, sourceLanguage }),
+  });
+}
+
 export async function getJob(jobId: string): Promise<Job> {
   return api(`/api/jobs/${jobId}`);
 }

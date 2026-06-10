@@ -40,6 +40,12 @@ const CreateJobFromSrtUploadSchema = z.object({
   srtContent: z.string().min(10).max(5_000_000),
 });
 
+const CreateJobFromSrtOnlySchema = z.object({
+  sourceLanguage: z.string().default("zh"),
+  targetLanguage: z.string().default("mn"),
+  srtContent: z.string().min(10).max(5_000_000),
+});
+
 const UpdateSegmentSchema = z.object({
   translatedText: z.string().min(1),
 });
@@ -243,6 +249,46 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       contentType,
       segmentCount: cues.length,
     };
+  });
+
+  /**
+   * 1e. SRT-only translate flow: user supplies a source-language SRT and
+   *     gets a translated SRT back. No video at any point — segments come
+   *     from the SRT, translate runs, the job lands in EDITING, and the
+   *     user downloads the result from the pre-render SRT bar.
+   */
+  app.post("/jobs/from-srt-only", async (request, reply) => {
+    const body = CreateJobFromSrtOnlySchema.parse(request.body);
+
+    const cues = parseSrt(body.srtContent);
+    if (cues.length === 0) {
+      return reply
+        .code(400)
+        .send({ error: "SRT файл хоосон эсвэл буруу форматтай байна" });
+    }
+
+    const job = await prisma.job.create({
+      data: {
+        sourceLanguage: body.sourceLanguage,
+        targetLanguage: body.targetLanguage,
+        // inputKey intentionally left null — render is not applicable.
+      },
+    });
+
+    await prisma.segment.createMany({
+      data: cues.map((c, idx) => ({
+        jobId: job.id,
+        sequence: idx,
+        startSec: c.startSec,
+        endSec: c.endSec,
+        sourceText: c.text,
+      })),
+    });
+
+    // No video to download, no STT — translate right away.
+    void safeRun(job.id, runTranslate);
+
+    return { jobId: job.id, segmentCount: cues.length };
   });
 
   /**

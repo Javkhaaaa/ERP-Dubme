@@ -878,6 +878,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
               )}
             </section>
 
+            {job.inputKey && (
             <section className="card">
               <h2 className="card-title">Гаргалтын тохиргоо</h2>
               <p className="card-subtitle">
@@ -1153,6 +1154,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
                       : "📄 Хадмал (SRT) гаргах"}
               </button>
             </section>
+            )}
           </>
         )}
 

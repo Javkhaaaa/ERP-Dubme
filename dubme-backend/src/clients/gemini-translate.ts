@@ -302,11 +302,14 @@ async function callWithRetry(prompt: string): Promise<string> {
           // little stochasticity lets Pro pick more natural phrasings over
           // its most-probable (often literal) first guess.
           temperature: 0.4,
-          // thinking off — Pro's deliberation adds 15-30s/batch for
-          // negligible quality gain on subtitle translation. With it off
-          // each batch returns in ~5-10s; combined with parallel waves
-          // below this brings a 2hr video from ~10min to ~1min total.
-          thinkingConfig: { thinkingBudget: 0 },
+          // Minimum thinking — Gemini 2.5 Pro REQUIRES thinking mode (the
+          // API rejects `thinkingBudget: 0` with INVALID_ARGUMENT on Pro).
+          // 128 is the smallest allowed value; it gives the model just
+          // enough headroom to apply the strict number-as-word / idiom
+          // rules without burning the ~3000 deliberation tokens dynamic
+          // mode would normally use. Combined with parallel waves below
+          // this brings a 2hr video from ~10min to ~1.5min total.
+          thinkingConfig: { thinkingBudget: 128 },
         },
       });
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);

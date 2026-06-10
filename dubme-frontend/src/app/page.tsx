@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   createJob,
   createJobFromSrt,
+  createJobFromSrtOnly,
   createJobFromSrtUpload,
   createJobFromUrl,
   listJobs,
@@ -34,12 +35,13 @@ function statusClass(s: JobStatus): string {
   return "status-pill active";
 }
 
-type ImportMode = "upload" | "url" | "srt";
+type ImportMode = "upload" | "url" | "srt" | "srt-only";
 
 const TABS: { id: ImportMode; label: string; sub: string }[] = [
   { id: "upload", label: "📁 Файл оруулах", sub: "Видеогоо browser-ээс upload хийнэ" },
   { id: "url", label: "🔗 URL-аас", sub: "Сервер шууд тат - upload хүлээх шаардлагагүй" },
   { id: "srt", label: "📄 SRT + Видео", sub: "Бэлэн хадмалыг орчуулаад mux хийнэ" },
+  { id: "srt-only", label: "📝 Зөвхөн SRT", sub: "Видеогүй — SRT-ийг л монгол руу орчуулаад татна" },
 ];
 
 /**
@@ -128,6 +130,10 @@ export default function Home() {
           sourceLanguage,
         );
         router.push(`/jobs/${jobId}`);
+      } else if (mode === "srt-only") {
+        if (!srtContent.trim()) throw new Error("SRT файл оруулна уу");
+        const { jobId } = await createJobFromSrtOnly(srtContent, sourceLanguage);
+        router.push(`/jobs/${jobId}`);
       } else {
         if (!srtContent.trim()) throw new Error("SRT файлаа оруулна уу");
         if (srtVideoSource === "url") {
@@ -175,6 +181,7 @@ export default function Home() {
     !busy &&
     ((mode === "upload" && !!file) ||
       (mode === "url" && !!videoUrl.trim()) ||
+      (mode === "srt-only" && !!srtContent.trim()) ||
       (mode === "srt" &&
         !!srtContent.trim() &&
         (srtVideoSource === "url"
@@ -243,7 +250,7 @@ export default function Home() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
+              gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
               gap: "0.4rem",
               marginBottom: "1rem",
               padding: "0.25rem",
@@ -341,6 +348,69 @@ export default function Home() {
                 .mp4 · .mov · .webm · .mkv линк. 1080p хүртэлх чанараар татна.
               </span>
             </label>
+          )}
+
+          {mode === "srt-only" && (
+            <>
+              <label style={{ marginBottom: "0.75rem" }}>
+                <span>SRT файл</span>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "0.5rem",
+                    alignItems: "center",
+                  }}
+                >
+                  <input
+                    type="file"
+                    accept=".srt,text/plain"
+                    onChange={(e) => onSrtFile(e.target.files?.[0] ?? null)}
+                    disabled={busy}
+                    style={{ flex: 1 }}
+                  />
+                  {srtFilename && (
+                    <span className="muted" style={{ fontSize: "0.8rem" }}>
+                      📄 {srtFilename}
+                    </span>
+                  )}
+                </div>
+              </label>
+
+              <label style={{ marginBottom: "1rem" }}>
+                <span>
+                  SRT агуулга (засаж болно — {srtContent.length} тэмдэгт)
+                </span>
+                <textarea
+                  value={srtContent}
+                  onChange={(e) => setSrtContent(e.target.value)}
+                  disabled={busy}
+                  rows={8}
+                  placeholder={`1\n00:00:01,000 --> 00:00:04,000\nFirst subtitle line\n\n2\n00:00:04,500 --> 00:00:07,000\nSecond line`}
+                  style={{
+                    width: "100%",
+                    resize: "vertical",
+                    fontFamily: "ui-monospace, monospace",
+                    fontSize: "0.85rem",
+                  }}
+                />
+              </label>
+
+              <p
+                className="card-subtitle"
+                style={{
+                  padding: "0.5rem 0.75rem",
+                  marginBottom: "1rem",
+                  background: "rgba(124, 92, 255, 0.08)",
+                  border: "1px solid rgba(124, 92, 255, 0.3)",
+                  borderRadius: 4,
+                  fontSize: "0.78rem",
+                }}
+              >
+                ℹ️ Энэ горимд видео хэрэглэгдэхгүй — зөвхөн SRT-ийг монгол руу
+                орчуулна. Эцсийн үр дүнг "Орчуулга шалгах" хуудаснаас SRT
+                файлаар татна.
+              </p>
+            </>
           )}
 
           {mode === "srt" && (
