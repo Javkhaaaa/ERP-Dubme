@@ -122,13 +122,14 @@ export async function runImportFromUrl(
   }
 }
 
-/** Steps 1+2: pull video → extract audio → STT → save segments. */
+/** Steps 1+2: pull media → extract audio → STT → save segments. */
 export async function runStt(jobId: string): Promise<void> {
   const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
   if (!job.inputKey) throw new Error("Job has no inputKey");
 
-  // 1. Download source video to /tmp.
-  const videoPath = tmpPath("mp4");
+  // 1. Download source media to /tmp. Accept both video uploads and
+  // audio-only uploads such as mp3/wav/m4a.
+  const inputPath = tmpPath(inputExtension(job.inputKey));
   const audioPath = tmpPath("ogg");
   try {
     console.log(`[pipeline] job=${jobId} → EXTRACTING`);
@@ -136,14 +137,14 @@ export async function runStt(jobId: string): Promise<void> {
       where: { id: jobId },
       data: { status: JobStatus.EXTRACTING },
     });
-    await downloadToFile(job.inputKey, videoPath);
-    const videoStat = await stat(videoPath);
-    console.log(`[pipeline] job=${jobId} downloaded ${videoStat.size} bytes`);
+    await downloadToFile(job.inputKey, inputPath);
+    const inputStat = await stat(inputPath);
+    console.log(`[pipeline] job=${jobId} downloaded ${inputStat.size} bytes`);
 
     // 2. Extract compressed mono Opus for STT (~5× smaller than 16kHz WAV;
     //    same transcription quality). Lets longer videos fit Whisper's
     //    file-size cap in one call.
-    await extractAudioCompressed(videoPath, audioPath);
+    await extractAudioCompressed(inputPath, audioPath);
     const audioStat = await stat(audioPath);
     console.log(`[pipeline] job=${jobId} extracted audio ${audioStat.size} bytes`);
 
@@ -193,7 +194,7 @@ export async function runStt(jobId: string): Promise<void> {
     await prisma.segment.deleteMany({ where: { jobId } });
     await prisma.segment.createMany({ data: rows });
   } finally {
-    safeUnlink(videoPath);
+    safeUnlink(inputPath);
     safeUnlink(audioPath);
   }
 }
@@ -594,6 +595,12 @@ function safeUnlink(path: string): void {
   } catch {
     // ignore — file may not exist if step failed early
   }
+}
+
+function inputExtension(inputKey: string): string {
+  const dot = inputKey.lastIndexOf(".");
+  if (dot === -1 || dot === inputKey.length - 1) return "bin";
+  return inputKey.slice(dot + 1).toLowerCase();
 }
 
 interface SynthesisGroup {

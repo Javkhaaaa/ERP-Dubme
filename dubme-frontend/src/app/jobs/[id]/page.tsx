@@ -476,6 +476,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   const isProcessing =
     job.status !== "DONE" && job.status !== "FAILED" && job.status !== "EDITING";
+  const hasVideoInput = !!job.inputKey && !isAudioInputKey(job.inputKey);
+  const hasAudioInput = !!job.inputKey && isAudioInputKey(job.inputKey);
 
   return (
     <>
@@ -547,7 +549,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
           </section>
         )}
 
-        {job.status === "EDITING" && previews.input && (
+        {job.status === "EDITING" && hasVideoInput && previews.input && (
           <section className="card">
             <h2 className="card-title">Эх видео</h2>
             <p className="card-subtitle">
@@ -587,6 +589,21 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 />
               )}
             </div>
+          </section>
+        )}
+
+        {job.status === "EDITING" && hasAudioInput && previews.input && (
+          <section className="card">
+            <h2 className="card-title">Эх аудио</h2>
+            <p className="card-subtitle">
+              MP3-аас хийсэн транскрипц ба орчуулгыг засах зуураа аудиогоо шууд сонсож болно
+            </p>
+            <audio
+              src={previews.input}
+              controls
+              preload="metadata"
+              style={{ width: "100%" }}
+            />
           </section>
         )}
 
@@ -878,7 +895,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
               )}
             </section>
 
-            {job.inputKey && (
+            {hasVideoInput && (
             <section className="card">
               <h2 className="card-title">Гаргалтын тохиргоо</h2>
               <p className="card-subtitle">
@@ -1202,6 +1219,16 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = (sec % 60).toFixed(1);
   return `${m}:${s.padStart(4, "0")}`;
+}
+
+function isAudioInputKey(inputKey: string): boolean {
+  const lower = inputKey.toLowerCase();
+  return (
+    lower.endsWith(".mp3") ||
+    lower.endsWith(".wav") ||
+    lower.endsWith(".m4a") ||
+    lower.endsWith(".ogg")
+  );
 }
 
 /**

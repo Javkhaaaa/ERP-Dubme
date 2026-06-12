@@ -416,9 +416,16 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
   app.post("/jobs/:id/render", async (request, reply) => {
     const { id } = request.params as { id: string };
     const body = StartRenderSchema.parse(request.body);
+    const job = await prisma.job.findUnique({ where: { id } });
+    if (!job) return reply.code(404).send({ error: "Job not found" });
 
     if (body.outputMode === "dub" && !body.voiceName) {
       return reply.code(400).send({ error: "voiceName is required for dubbing" });
+    }
+    if (job.inputKey && isAudioInputKey(job.inputKey)) {
+      return reply
+        .code(400)
+        .send({ error: "Audio-only job дээр video render хийхгүй. SRT-г шууд татна уу." });
     }
 
     await prisma.job.update({
@@ -565,6 +572,10 @@ function guessContentType(filename: string): string {
   if (lower.endsWith(".mov")) return "video/quicktime";
   if (lower.endsWith(".webm")) return "video/webm";
   if (lower.endsWith(".mkv")) return "video/x-matroska";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".m4a")) return "audio/mp4";
+  if (lower.endsWith(".ogg")) return "audio/ogg";
   return "application/octet-stream";
 }
 
@@ -574,6 +585,20 @@ function extensionFor(contentType: string): string {
     case "video/quicktime": return ".mov";
     case "video/webm": return ".webm";
     case "video/x-matroska": return ".mkv";
+    case "audio/mpeg": return ".mp3";
+    case "audio/wav": return ".wav";
+    case "audio/mp4": return ".m4a";
+    case "audio/ogg": return ".ogg";
     default: return "";
   }
+}
+
+function isAudioInputKey(inputKey: string): boolean {
+  const lower = inputKey.toLowerCase();
+  return (
+    lower.endsWith(".mp3") ||
+    lower.endsWith(".wav") ||
+    lower.endsWith(".m4a") ||
+    lower.endsWith(".ogg")
+  );
 }
