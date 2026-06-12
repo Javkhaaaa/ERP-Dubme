@@ -173,6 +173,12 @@ export interface SegmentClip {
   audioPath: string; // local path to the segment's WAV
 }
 
+export interface MixedClipPlacement {
+  startSec: number;
+  endSec: number;
+  sourceStartSec: number;
+}
+
 export interface MixOptions {
   /**
    * Path to the original extracted audio (e.g. Chinese speech).
@@ -226,7 +232,7 @@ export async function mixSegmentsToTimeline(
   totalDurationSec: number,
   outPath: string,
   options: MixOptions = {},
-): Promise<void> {
+): Promise<MixedClipPlacement[]> {
   if (clips.length === 0) {
     throw new Error("No clips to mix");
   }
@@ -358,6 +364,11 @@ export async function mixSegmentsToTimeline(
         `max_drift=${maxDrift.toFixed(2)}s overflow_after=${overflowCount} ` +
         (useOriginal ? `duck=${duckLevel}` : "no-original"),
     );
+    return placements.map((p) => ({
+      startSec: p.start,
+      endSec: p.end,
+      sourceStartSec: p.sourceStart,
+    }));
   } finally {
     // Clean up trimmed files even on error.
     await Promise.all(
@@ -526,10 +537,11 @@ export async function writeSrt(
 }
 
 export function formatSrtTime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const ms = Math.round((seconds - Math.floor(seconds)) * 1000);
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(totalMs / 3_600_000);
+  const m = Math.floor((totalMs % 3_600_000) / 60_000);
+  const s = Math.floor((totalMs % 60_000) / 1000);
+  const ms = totalMs % 1000;
   return (
     `${String(h).padStart(2, "0")}:` +
     `${String(m).padStart(2, "0")}:` +

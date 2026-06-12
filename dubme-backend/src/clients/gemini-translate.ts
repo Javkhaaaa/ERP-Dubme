@@ -84,6 +84,18 @@ export async function translateSegments(
     );
   }
 
+  const missing = results
+    .map((text, idx) => ({ text: text.trim(), idx }))
+    .filter((x) => !x.text)
+    .map((x) => x.idx + 1);
+  if (missing.length > 0) {
+    throw new Error(
+      `Translation incomplete: ${missing.length} line(s) missing translated text (examples: ${missing
+        .slice(0, 10)
+        .join(", ")})`,
+    );
+  }
+
   return results;
 }
 
@@ -212,6 +224,18 @@ export async function refineSegments(
     );
   }
 
+  const missing = results
+    .map((text, idx) => ({ text: text.trim(), idx }))
+    .filter((x) => !x.text)
+    .map((x) => x.idx + 1);
+  if (missing.length > 0) {
+    throw new Error(
+      `Refine incomplete: ${missing.length} line(s) missing refined text (examples: ${missing
+        .slice(0, 10)
+        .join(", ")})`,
+    );
+  }
+
   return results;
 }
 
@@ -336,26 +360,44 @@ async function callWithRetry(prompt: string): Promise<string> {
 }
 
 /**
- * Parse Gemini's "1. ...\n2. ..." output back into an array.
- * Tolerates extra whitespace, "1)" / "1." styles, and missing lines (filled with "").
+ * Parse Gemini's numbered output back into an array.
+ * Handles:
+ * - `1.` and `1)` numbering styles
+ * - multi-line entries where the model wraps one translation over several lines
+ * - plain line-by-line fallback when numbering is absent but count matches
  */
 function parseNumberedLines(text: string, expectedCount: number): string[] {
-  const lines = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const lines = text.split("\n").map((l) => l.trim());
   const out: string[] = new Array(expectedCount).fill("");
-  for (const line of lines) {
+  let currentIdx = -1;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
     const match = line.match(/^(\d+)[\.\)]\s*(.+)$/);
-    if (!match) continue;
-    const idx = Number.parseInt(match[1], 10) - 1;
-    if (idx >= 0 && idx < expectedCount) {
-      out[idx] = match[2].trim();
+    if (match) {
+      const idx = Number.parseInt(match[1], 10) - 1;
+      if (idx >= 0 && idx < expectedCount) {
+        out[idx] = match[2].trim();
+        currentIdx = idx;
+      } else {
+        currentIdx = -1;
+      }
+      continue;
+    }
+
+    // Continuation of the previous numbered line.
+    if (currentIdx >= 0 && currentIdx < expectedCount) {
+      out[currentIdx] = `${out[currentIdx]} ${line}`.trim();
     }
   }
-  // If the model didn't follow numbering, fall back to line-by-line.
-  if (out.every((s) => s === "") && lines.length === expectedCount) {
-    return lines;
+
+  // If the model ignored numbering entirely but still returned the right
+  // number of non-empty lines, accept them positionally.
+  const nonEmptyLines = lines.filter(Boolean);
+  if (out.every((s) => s === "") && nonEmptyLines.length === expectedCount) {
+    return nonEmptyLines;
   }
+
   return out;
 }

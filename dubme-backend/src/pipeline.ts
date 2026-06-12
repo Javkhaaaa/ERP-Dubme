@@ -14,6 +14,7 @@ import {
   type BurnSubtitleStyle,
   extractAudio,
   extractAudioCompressed,
+  type MixedClipPlacement,
   mixSegmentsToTimeline,
   probeDuration,
   replaceAudioTrack,
@@ -449,7 +450,7 @@ export async function runRender(jobId: string): Promise<void> {
     // round-trip and guarantees the file is present on this run.
     await extractAudio(videoPath, originalAudioPath);
 
-    await mixSegmentsToTimeline(segmentClips, duration, mixedPath, {
+    const placements = await mixSegmentsToTimeline(segmentClips, duration, mixedPath, {
       originalAudioPath,
       // Original plays at FULL volume between segments (music, atmosphere come through).
       // While a Mongolian segment is speaking, original ducks to 5% (-26 dB) —
@@ -459,7 +460,8 @@ export async function runRender(jobId: string): Promise<void> {
     await replaceAudioTrack(videoPath, mixedPath, dubbedPath);
 
     // SRT subtitle (always produced as a downloadable artifact).
-    await writeSrt(cues, srtPath);
+    const dubbedCues = buildDubSubtitleCues(groups, placements, subtitleText);
+    await writeSrt(dubbedCues, srtPath);
 
     // Optionally hardsub the subtitles onto the dubbed video.
     let finalVideoPath = dubbedPath;
@@ -526,6 +528,52 @@ function buildSubtitleCues(
       return { startSec: s.startSec, endSec: s.endSec, text };
     })
     .filter((c) => c.text.length > 0);
+}
+
+function buildDubSubtitleCues(
+  groups: SynthesisGroup[],
+  placements: MixedClipPlacement[],
+  mode: SubtitleText,
+): SubtitleCue[] {
+  const cues: SubtitleCue[] = [];
+
+  groups.forEach((group, groupIdx) => {
+    const placement = placements[groupIdx];
+    if (!placement) return;
+
+    const raw: {
+      startSec: number;
+      endSec: number;
+      sourceText: string;
+      translatedText: string | null;
+    }[] = group.segments.map((s) => ({
+        startSec: s.startSec,
+        endSec: s.endSec,
+        sourceText: s.sourceText,
+        translatedText: s.translatedText,
+      }));
+    const groupCues = buildSubtitleCues(raw, mode);
+    if (groupCues.length === 0) return;
+
+    const sourceGroupStart = group.segments[0].startSec;
+    const sourceGroupEnd = group.segments[group.segments.length - 1].endSec;
+    const sourceSpan = Math.max(0.001, sourceGroupEnd - sourceGroupStart);
+    const dubbedSpan = Math.max(0.001, placement.endSec - placement.startSec);
+
+    for (const cue of groupCues) {
+      const relStart = (cue.startSec - sourceGroupStart) / sourceSpan;
+      const relEnd = (cue.endSec - sourceGroupStart) / sourceSpan;
+      const startSec = placement.startSec + relStart * dubbedSpan;
+      const endSec = placement.startSec + relEnd * dubbedSpan;
+      cues.push({
+        startSec,
+        endSec: Math.max(startSec + 0.01, endSec),
+        text: cue.text,
+      });
+    }
+  });
+
+  return cues;
 }
 
 /**
@@ -609,6 +657,7 @@ interface SynthesisGroup {
     sequence: number;
     startSec: number;
     endSec: number;
+    sourceText: string;
     translatedText: string | null;
   }[];
 }
@@ -637,6 +686,7 @@ function groupForSynthesis(
     sequence: number;
     startSec: number;
     endSec: number;
+    sourceText: string;
     translatedText: string | null;
   }[],
   opts: { maxGapSec: number; maxChars: number },
