@@ -38,7 +38,7 @@ function statusClass(s: JobStatus): string {
 type ImportMode = "upload" | "url" | "srt" | "srt-only";
 
 const TABS: { id: ImportMode; label: string; sub: string }[] = [
-  { id: "upload", label: "📁 Файл оруулах", sub: "Видеогоо browser-ээс upload хийнэ" },
+  { id: "upload", label: "📁 Файл оруулах", sub: "Видео эсвэл MP3 аудиогоо browser-ээс upload хийнэ" },
   { id: "url", label: "🔗 URL-аас", sub: "Сервер шууд тат - upload хүлээх шаардлагагүй" },
   { id: "srt", label: "📄 SRT + Видео", sub: "Бэлэн хадмалыг орчуулаад mux хийнэ" },
   { id: "srt-only", label: "📝 Зөвхөн SRT", sub: "Видеогүй — SRT-ийг л монгол руу орчуулаад татна" },
@@ -167,7 +167,9 @@ export default function Home() {
     e.preventDefault();
     setDragOver(false);
     const f = e.dataTransfer.files?.[0];
-    if (f && f.type.startsWith("video/")) setFile(f);
+    if (f && (f.type.startsWith("video/") || f.type.startsWith("audio/"))) {
+      setFile(f);
+    }
   };
 
   const onSrtFile = async (f: File | null) => {
@@ -308,12 +310,12 @@ export default function Home() {
               <div className="muted">
                 {file
                   ? `${(file.size / 1024 / 1024).toFixed(1)} MB`
-                  : ".mp4 · .mov · .webm · .mkv — 2GB хүртэл"}
+                  : ".mp4 · .mov · .webm · .mkv · .mp3 · .wav · .m4a · .ogg"}
               </div>
               <input
                 id="file-input"
                 type="file"
-                accept="video/*"
+                accept="video/*,audio/*,.mp3,.wav,.m4a,.ogg"
                 onChange={(e) => setFile(e.target.files?.[0] ?? null)}
                 disabled={busy}
                 style={{ display: "none" }}
