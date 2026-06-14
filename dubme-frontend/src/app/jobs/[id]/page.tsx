@@ -231,6 +231,10 @@ export default function JobPage({ params }: { params: { id: string } }) {
         case "TRANSLATING": return 3000;
         case "SYNTHESIZING": return 3000;
         case "MUXING": return 4000;
+        // EDITING is a stable, user-driven pause: nothing changes until the
+        // user renders or refines, so poll slowly when idle (the refining
+        // override below speeds back up while a background refine runs).
+        case "EDITING": return 12000;
         default: return 2500;
       }
     };
@@ -297,7 +301,10 @@ export default function JobPage({ params }: { params: { id: string } }) {
             .catch(() => void 0);
         }
 
-        if (!cancelled) timer = setTimeout(poll, intervalForStatus(j.status));
+        // While a background refine runs, poll fast so completion is detected
+        // promptly; otherwise use the per-status cadence (slow when idle).
+        const nextMs = j.refining ? 2500 : intervalForStatus(j.status);
+        if (!cancelled) timer = setTimeout(poll, nextMs);
       } catch (err) {
         console.error(err);
         if (!cancelled) timer = setTimeout(poll, 5000);
@@ -403,6 +410,19 @@ export default function JobPage({ params }: { params: { id: string } }) {
       });
       // Reset polling guards so the new render's progress + outputs load.
       downloadsLoadedRef.current = false;
+      // Optimistically flip out of EDITING so the progress UI shows instantly
+      // (the idle poll is on a slow cadence; the next tick confirms the real
+      // status). Avoids a multi-second "nothing happened" gap after clicking.
+      setJob((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: outputMode === "dub" ? "SYNTHESIZING" : "MUXING",
+              progress: 0,
+              progressNote: null,
+            }
+          : prev,
+      );
     } finally {
       setBusy(false);
     }

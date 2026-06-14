@@ -392,10 +392,13 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
     if (segments.length === 0) {
       return reply.code(400).send({ error: "Орчуулах segment алга" });
     }
-    if (segments.some((s) => !s.translatedText)) {
+    // No hard block on a few blank lines. Refine works from the SOURCE text, so
+    // a missing translation isn't fatal — it's simply rebuilt from source. Only
+    // bail if there's literally nothing translated at all to refine.
+    if (segments.every((s) => !s.translatedText?.trim())) {
       return reply
         .code(400)
-        .send({ error: "Орчуулга бүрэн дуусаагүй байна — refine хийх боломжгүй" });
+        .send({ error: "Орчуулга хараахан бэлэн биш байна — түр хүлээгээд дахин оролдоно уу." });
     }
 
     await prisma.job.update({ where: { id }, data: { refining: true, refineError: null } });
@@ -404,7 +407,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       try {
         const refined = await refineSegments(
           segments.map((s) => s.sourceText),
-          segments.map((s) => s.translatedText!),
+          segments.map((s) => s.translatedText ?? ""),
           job.sourceLanguage,
           job.targetLanguage,
           body.prompt,

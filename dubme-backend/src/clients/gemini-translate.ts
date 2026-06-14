@@ -265,21 +265,10 @@ export async function refineSegments(
   });
 
   // Never blank a line during refine — if the model dropped one, keep the
-  // existing translation rather than overwriting it with "".
+  // existing translation rather than overwriting it with "". (No "incomplete"
+  // throw: a refine must never destroy an already-good translation.)
   for (let i = 0; i < results.length; i++) {
     if (!results[i] || !results[i].trim()) results[i] = currentTranslations[i] ?? "";
-  }
-
-  const missing = results
-    .map((text, idx) => ({ text: text.trim(), idx }))
-    .filter((x) => !x.text)
-    .map((x) => x.idx + 1);
-  if (missing.length > 0) {
-    throw new Error(
-      `Refine incomplete: ${missing.length} line(s) missing refined text (examples: ${missing
-        .slice(0, 10)
-        .join(", ")})`,
-    );
   }
 
   return results;
