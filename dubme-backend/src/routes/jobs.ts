@@ -3,11 +3,13 @@ import { z } from "zod";
 import { prisma } from "../db.js";
 import { presignDownload, presignUpload } from "../storage.js";
 import {
+  bulkUpdateTranslations,
+  importVideoForJob,
   jobDownloadUrls,
-  runImportFromUrl,
   runRender,
   runStt,
   runTranslate,
+  runUrlImportAndStt,
   safeRun,
 } from "../pipeline.js";
 import { refineSegments } from "../clients/gemini-translate.js";
@@ -54,6 +56,8 @@ const RefineSchema = z.object({
   prompt: z.string().trim().min(3).max(1000),
 });
 
+const hexColor = z.string().regex(/^#[0-9A-Fa-f]{6}$/);
+
 const StartRenderSchema = z.object({
   // Optional: subtitle-only renders don't pick a voice.
   voiceName: z.string().min(1).optional(),
@@ -66,26 +70,32 @@ const StartRenderSchema = z.object({
   subtitleText: z.enum(["translated", "source", "both"]).default("translated"),
   /** Burn the subtitle onto the video (hardsub) in addition to the SRT file. */
   subtitleBurn: z.boolean().default(false),
-  /** Font size in pixels. */
-  subtitleFontSize: z.number().int().min(10).max(60).default(22),
-  /** Text colour as #RRGGBB. */
-  subtitleTextColor: z
-    .string()
-    .regex(/^#[0-9A-Fa-f]{6}$/)
-    .default("#FFFFFF"),
-  /** Background fill colour as #RRGGBB, or null/omitted for no background. */
-  subtitleBgColor: z
-    .string()
-    .regex(/^#[0-9A-Fa-f]{6}$/)
-    .nullable()
-    .optional(),
-  /**
-   * Legacy 3-option position. Still accepted for compatibility but ignored
-   * when subtitlePositionPct is provided.
-   */
-  subtitlePosition: z.enum(["top", "middle", "bottom"]).default("bottom"),
-  /** Vertical position 0-100% from top of frame. */
+  /** Cap output to 1080p before burning (big speed win on 4K). */
+  capTo1080: z.boolean().default(true),
+
+  // ── Subtitle style (sizes/widths are px @ 1080p reference) ──────────────
+  subtitleFontFamily: z.string().min(1).max(40).default("Noto Sans"),
+  subtitleFontSize: z.number().int().min(12).max(160).default(48),
+  subtitleBold: z.boolean().default(false),
+  subtitleItalic: z.boolean().default(false),
+  subtitleTextColor: hexColor.default("#FFFFFF"),
+  subtitleOutlineWidth: z.number().min(0).max(8).default(3),
+  subtitleOutlineColor: hexColor.default("#000000"),
+  subtitleOutlineAlpha: z.number().int().min(0).max(100).default(80),
+  subtitleShadowDepth: z.number().min(0).max(8).default(0),
+  subtitleShadowColor: hexColor.default("#000000"),
+  subtitleBgColor: hexColor.nullable().optional(),
+  subtitleBgOpacity: z.number().int().min(0).max(100).default(75),
+  subtitleAlign: z.enum(["left", "center", "right"]).default("center"),
+  subtitleMarginHPct: z.number().int().min(0).max(40).default(4),
+  subtitleLetterSpacing: z.number().min(-2).max(10).default(0),
+  /** Vertical position 0-100% from top (to the bottom edge of the text block). */
   subtitlePositionPct: z.number().int().min(0).max(100).default(88),
+  /** Dual-language ("both") mode: zh line size relative to main, and its colour. */
+  subtitleZhScale: z.number().min(0.4).max(1.5).default(0.8),
+  subtitleZhColor: hexColor.nullable().optional(),
+  /** Legacy 3-option position — accepted but no longer read. */
+  subtitlePosition: z.enum(["top", "middle", "bottom"]).default("bottom"),
 });
 
 export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
@@ -139,10 +149,10 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
     });
 
     void (async () => {
-      await safeRun(job.id, (id) => runImportFromUrl(id, body.url));
-      const fresh = await prisma.job.findUnique({ where: { id: job.id } });
-      if (fresh?.status === "FAILED") return;
-      await safeRun(job.id, runStt);
+      // Audio-first: download only the audio and run STT immediately while the
+      // full video downloads in the background — so the user reaches EDITING
+      // (and can grab an SRT) without waiting on a multi-GB video download.
+      await safeRun(job.id, (id) => runUrlImportAndStt(id, body.url));
       const afterStt = await prisma.job.findUnique({ where: { id: job.id } });
       if (afterStt?.status === "FAILED") return;
       await safeRun(job.id, runTranslate);
@@ -188,13 +198,11 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       })),
     });
 
-    void (async () => {
-      await safeRun(job.id, (id) => runImportFromUrl(id, body.videoUrl));
-      const fresh = await prisma.job.findUnique({ where: { id: job.id } });
-      if (fresh?.status === "FAILED") return;
-      // No runStt — the segments are already populated from the SRT.
-      await safeRun(job.id, runTranslate);
-    })();
+    // Segments are already populated from the SRT, so translate can start
+    // immediately; the video downloads in the background (only needed if the
+    // user later renders/burns).
+    importVideoForJob(job.id, body.videoUrl);
+    void safeRun(job.id, runTranslate);
 
     return { jobId: job.id, segmentCount: cues.length };
   });
@@ -358,10 +366,11 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
   });
 
   /**
-   * 5b. Re-translate every segment with a user-supplied style instruction
-   *     (e.g. "ярианы аястай", "албан ёсны мэдээний өнгөөр", or any custom
-   *     prompt). Runs synchronously — caller polls via the returned segments.
-   *     Only valid while the job is paused in EDITING.
+   * 5b. Re-translate every segment with a user-supplied style instruction.
+   *     Runs in the BACKGROUND (like render) — long videos would otherwise
+   *     hold the HTTP connection open past proxy timeouts. The endpoint flips
+   *     `refining=true` and returns 202; the editor polls GET /jobs/:id and
+   *     refetches segments when `refining` clears. Only valid in EDITING.
    */
   app.post("/jobs/:id/refine", async (request, reply) => {
     const { id } = request.params as { id: string };
@@ -370,9 +379,10 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
     const job = await prisma.job.findUnique({ where: { id } });
     if (!job) return reply.code(404).send({ error: "Job not found" });
     if (job.status !== "EDITING") {
-      return reply
-        .code(409)
-        .send({ error: `Refine хийх боломжгүй (status=${job.status})` });
+      return reply.code(409).send({ error: `Refine хийх боломжгүй (status=${job.status})` });
+    }
+    if (job.refining) {
+      return reply.code(409).send({ error: "Өмнөх сайжруулалт дуусаагүй байна" });
     }
 
     const segments = await prisma.segment.findMany({
@@ -388,28 +398,33 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
         .send({ error: "Орчуулга бүрэн дуусаагүй байна — refine хийх боломжгүй" });
     }
 
-    const refined = await refineSegments(
-      segments.map((s) => s.sourceText),
-      segments.map((s) => s.translatedText!),
-      job.sourceLanguage,
-      job.targetLanguage,
-      body.prompt,
-    );
+    await prisma.job.update({ where: { id }, data: { refining: true, refineError: null } });
 
-    // AI-rewritten — clear the `edited` flag (human edits will set it again).
-    await prisma.$transaction(
-      refined.map((text, idx) =>
-        prisma.segment.update({
-          where: { id: segments[idx].id },
-          data: { translatedText: text, edited: false },
-        }),
-      ),
-    );
+    void (async () => {
+      try {
+        const refined = await refineSegments(
+          segments.map((s) => s.sourceText),
+          segments.map((s) => s.translatedText!),
+          job.sourceLanguage,
+          job.targetLanguage,
+          body.prompt,
+        );
+        // AI-rewritten — clear `edited` (human edits will set it again), one round-trip.
+        await bulkUpdateTranslations(
+          refined.map((text, idx) => ({ id: segments[idx].id, text })),
+          true,
+        );
+        await prisma.job.update({ where: { id }, data: { refining: false } });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[refine] job ${id} failed:`, err);
+        await prisma.job
+          .update({ where: { id }, data: { refining: false, refineError: msg } })
+          .catch(() => void 0);
+      }
+    })();
 
-    return prisma.segment.findMany({
-      where: { jobId: id },
-      orderBy: { sequence: "asc" },
-    });
+    return reply.code(202).send({ ok: true, refining: true });
   });
 
   /** 6. Trigger TTS + mux. Voice + style chosen here. */
@@ -431,11 +446,28 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
         outputMode: body.outputMode,
         subtitleText: body.subtitleText,
         subtitleBurn: body.subtitleBurn,
+        capTo1080: body.capTo1080,
+        subtitleFontFamily: body.subtitleFontFamily,
         subtitleFontSize: body.subtitleFontSize,
+        subtitleBold: body.subtitleBold,
+        subtitleItalic: body.subtitleItalic,
         subtitleTextColor: body.subtitleTextColor,
+        subtitleOutlineWidth: body.subtitleOutlineWidth,
+        subtitleOutlineColor: body.subtitleOutlineColor,
+        subtitleOutlineAlpha: body.subtitleOutlineAlpha,
+        subtitleShadowDepth: body.subtitleShadowDepth,
+        subtitleShadowColor: body.subtitleShadowColor,
         subtitleBgColor: body.subtitleBgColor ?? null,
+        subtitleBgOpacity: body.subtitleBgOpacity,
+        subtitleAlign: body.subtitleAlign,
+        subtitleMarginHPct: body.subtitleMarginHPct,
+        subtitleLetterSpacing: body.subtitleLetterSpacing,
         subtitlePosition: body.subtitlePosition,
         subtitlePositionPct: body.subtitlePositionPct,
+        subtitleZhScale: body.subtitleZhScale,
+        subtitleZhColor: body.subtitleZhColor ?? null,
+        progress: 0,
+        progressNote: null,
       },
     });
 

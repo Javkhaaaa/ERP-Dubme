@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   getDownloadUrls,
@@ -11,16 +11,16 @@ import {
   jobSrtDownloadUrl,
   refineTranslations,
   startRender,
+  SUBTITLE_REF_HEIGHT,
   updateSegment,
   type Job,
   type JobStatus,
   type OutputMode,
   type Segment,
-  type SubtitlePosition,
+  type SubtitleAlign,
   type SubtitleText,
 } from "@/lib/api";
 import { CHIMEGE_VOICES, GEMINI_VOICES } from "@/lib/voices";
-
 
 const PIPELINE_STEPS: { id: JobStatus; label: string }[] = [
   { id: "UPLOADED", label: "Орлоо" },
@@ -35,7 +35,7 @@ const PIPELINE_STEPS: { id: JobStatus; label: string }[] = [
 
 const STATUS_LABEL: Record<JobStatus, string> = {
   UPLOADED: "Видео хүлээгдэж байна",
-  DOWNLOADING: "URL-аас татаж байна",
+  DOWNLOADING: "Татаж байна",
   EXTRACTING: "Аудио гаргаж байна",
   TRANSCRIBING: "Хятад транскрипц",
   TRANSLATING: "Монгол руу орчуулж байна",
@@ -45,131 +45,6 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   DONE: "Бэлэн",
   FAILED: "Алдаа",
 };
-
-/**
- * Pre-filled style instructions for the "Орчуулга сайжруулах" card.
- * Genre-driven — picking a preset tells Gemini what kind of content it's
- * dubbing so it adapts vocabulary, register, and pacing accordingly.
- * The textarea is always editable; "Өөрөө бичих" just clears it.
- */
-const REFINE_PRESETS: { id: string; label: string; prompt: string }[] = [
-  {
-    id: "news",
-    label: "📰 Мэдээний нэвтрүүлэг",
-    prompt:
-      "Энэ бол албан ёсны мэдээний нэвтрүүлэг. Орчуулгыг objective, цэгцтэй, " +
-      "утга төгс мэдээний өнгөөр зас. Гуравдугаар бие, идэвхтэй өгүүлбэр " +
-      "хэлбэр. Бодит баримт, цаг хугацаа, газар нэрийг үнэн зөв илэрхийл. " +
-      "Хэт яриа, ойр дотно үгсээс зайлсхий. 'Мэдэгдсэн', 'явагдаж байна', " +
-      "'тогтоосон', 'олон нийтийн анхааралд' гэх мэт мэдээний нийтлэг хэллэг " +
-      "ашигла. Хүндэт хүмүүсийг нэр + албан тушаалаар нь дурдана.",
-  },
-  {
-    id: "documentary",
-    label: "🎥 Баримтат кино",
-    prompt:
-      "Энэ бол баримтат кино. Орчуулгыг өгүүлэгчийн (narrator) тайван, " +
-      "судалгаатай өнгө аястай болгож зас. Уншиж тайлбарлаж буй мэт " +
-      "цэгцтэй, гэхдээ мэдээллээс илүү сэтгэл татах байх. Дүрсэлсэн үг " +
-      "хэрэглэж болно ('энэхүү ховор амьтан', 'тухайн үед', 'үе үе') " +
-      "гэхдээ объектив байдлаа барина.",
-  },
-  {
-    id: "horror",
-    label: "👻 Аймшгийн кино",
-    prompt:
-      "Энэ бол аймшгийн кино. Орчуулгыг айдас, түгшүүртэй уур амьсгал " +
-      "төрүүлэх үгсээр зас. Богино, огцом өгүүлбэр ашигла. Чимээгүй айдас, " +
-      "сэжиглэл илэрхийлэх үг сонго ('сэжиглэх', 'шивнэх', 'чичрэх', " +
-      "'ширтэх', 'нууцлаг', 'мөрөөр нь', 'юу нуугдаж байгаа юм бэ'). " +
-      "Өчүүхэн зүйлийг ч нууцлаг, сөрөг утгатайгаар илэрхийл. Тоглогчийн " +
-      "хоолой чичрэх, шивгэнэхэд тохирох үгийн сонголт хий — гэхдээ кинонд " +
-      "хэрэглэгдэхүйц байх ёстой, хийсвэр болгож болохгүй.",
-  },
-  {
-    id: "comedy",
-    label: "😂 Инээдмийн кино",
-    prompt:
-      "Энэ бол инээдмийн кино. Орчуулгыг хөгжилтэй, инээдтэй, чөлөөт " +
-      "ярианы аястай болго. Slang болон онигоонд ашиглагддаг хэллэг " +
-      "('тийм кони', 'ёстой шал', 'ёо ёо', 'юу гэх вэ дээ', 'наанаас нь', " +
-      "'аа тоо', 'үнэхээр зөв') чөлөөтэй ашигла. Адал сэтгэл хөдлөл, " +
-      "элэглэх, гайхах өнгө аяс илэрхийлэхэд тохирох богино тодорхой " +
-      "үгсийг сонго. Хараал, бүдүүлэг үг бичиж болохгүй ч ширүүн " +
-      "илэрхийлэл ('адар', 'өл', 'юу гэв ээ') зөвшөөрөгдөнө.",
-  },
-  {
-    id: "drama",
-    label: "💔 Драм / Сэтгэл хөдлөм",
-    prompt:
-      "Энэ бол драмын/сэтгэл хөдлөм кино. Орчуулгыг дотоод мэдрэмж, " +
-      "сэтгэлийн гүн илэрхийлэл бүхий үгсээр зас. Зүрхэнд нөлөөлөх, " +
-      "уянгын утгатай үг сонго ('хүсэн хүлээх', 'санах', 'өвдөх', " +
-      "'гэгээрэх', 'асгарах нулимс', 'санасан зүйлс минь', 'зүрх зүсэх'). " +
-      "Уулзалт, салалт, эргэлзээ, хайр, найдвар зэрэг сэтгэл хөдлөлийг " +
-      "тодорхой илэрхийл. Өгүүлбэрийг чөлөөтэй болгож болно гэхдээ " +
-      "дубляжид тохирох уртаар үлдээ.",
-  },
-  {
-    id: "action",
-    label: "🔥 Адал явдалт (Action)",
-    prompt:
-      "Энэ бол адал явдалт (action) кино. Орчуулгыг эрчимтэй, эрч хүчтэй, " +
-      "богино тушаалт өгүүлбэрээр зас. Зэвсэг, тулаан, мөшгөлт зэрэг " +
-      "өрнөлд тохирох үг ('сум', 'дайралт', 'гар', 'ширт', 'явъя', " +
-      "'болих хэрэгтэй', 'бид гарна') сонго. Үсрэх, цохих, хашгирах " +
-      "хөдөлгөөнийг тодорхой илэрхийл. Огцом тушаал: 'Бүгд гадагш!', " +
-      "'Унагах!', 'Хурдан!' гэх мэтийг хэлэгдсэн газарт нь ашиглана.",
-  },
-  {
-    id: "kid",
-    label: "🧸 Хүүхдэд зориулсан",
-    prompt:
-      "Энэ бол хүүхдэд зориулагдсан контент. Орчуулгыг хүүхдийн ойлгох " +
-      "энгийн, найрсаг, эерэг үгсээр зас. Айдас төрүүлэх, хүчтэй сэтгэл " +
-      "хөдлөлтэй, ярвигтай үгсээс зайлсхий. Хөгжилтэй, ойлгомжтой, дотно " +
-      "үг хэрэглэ ('амьтад', 'хөгжилтэй', 'найзууд', 'явцгаая', 'тоглоё', " +
-      "'хараач'). Өгүүлбэр богино, ойлгомжтой бүтэцтэй.",
-  },
-  {
-    id: "tutorial",
-    label: "🎓 Хичээл / Туториал",
-    prompt:
-      "Энэ бол сурах хичээл/туториал контент. Орчуулгыг сурагчдад үе " +
-      "шаттай тайлбарласан, ойлгомжтой, заах өнгөөр зас. 'Эхлээд...', " +
-      "'Дараа нь...', 'Жишээ нь...', 'Анхааралтай байгаарай', 'Дашрамд " +
-      "хэлэхэд' гэх мэт зааж сургах хэллэг тохиромжтой газарт нь оруул. " +
-      "Техникийн нэр томьёог үндсэн утгаар нь үлдээж болно, гэхдээ " +
-      "тоонуудыг үг болгох ёстой.",
-  },
-  {
-    id: "podcast",
-    label: "🎙️ Подкаст / Ярилцлага",
-    prompt:
-      "Энэ бол подкаст эсвэл ярилцлагын бичлэг. Орчуулгыг хоёр хүн " +
-      "дотноор ярьж буй мэт, хагас албан ёсны, ярианы өнгөтэй болго. " +
-      "Анхааралтай сонсогдох бодолт, дамжих үгс ('тийм ээ', 'тэгээд " +
-      "яасан гэхэд', 'байж болох уу', 'миний бодлоор', 'үнэндээ') " +
-      "тохиромжтой газарт ашигла. Гэхдээ хэт ярианы 'юу', 'хм' зэргийг " +
-      "хэт олон оруулахгүй.",
-  },
-  {
-    id: "vlog",
-    label: "📱 Влог / Хувийн бичлэг",
-    prompt:
-      "Энэ бол влог эсвэл хувийн бичлэг (vlog). Орчуулгыг өөртөө ярьж " +
-      "буй мэт, ил тод, ярианы аястай болго. 'Би', 'миний', 'танд' гэх " +
-      "мэт хувийн үгсийг чөлөөтэй ашигла. Эрч хүчтэй, эерэг өнгө аяс " +
-      "('өнөөдөр энэ юу хийе гэж бодож байна', 'ёстой их сонирхолтой " +
-      "юм', 'та нар яалт ч үгүй харах хэрэгтэй'). Залуу үзэгчдэд тохирох " +
-      "чөлөөт хэллэг зөвшөөрөгдөнө.",
-  },
-  {
-    id: "custom",
-    label: "✍️ Өөрөө бичих",
-    prompt: "",
-  },
-];
 
 const STATUS_ICON: Record<JobStatus, string> = {
   UPLOADED: "📤",
@@ -184,13 +59,101 @@ const STATUS_ICON: Record<JobStatus, string> = {
   FAILED: "❌",
 };
 
-function stepStatus(
-  current: JobStatus,
-  step: JobStatus,
-): "done" | "active" | "pending" {
+/** Bundled subtitle fonts — must match the backend SUBTITLE_FONTS list. */
+const SUBTITLE_FONTS: { value: string; label: string }[] = [
+  { value: "Noto Sans", label: "Noto Sans" },
+  { value: "PT Sans", label: "PT Sans" },
+  { value: "Noto Serif", label: "Noto Serif" },
+];
+
+interface SubStyle {
+  fontFamily: string;
+  fontSize: number; // px @ 1080p
+  bold: boolean;
+  italic: boolean;
+  textColor: string;
+  outlineWidth: number;
+  outlineColor: string;
+  outlineAlpha: number; // 0-100 % opaque
+  shadowDepth: number;
+  shadowColor: string;
+  bgColor: string | null;
+  bgOpacity: number; // 0-100 % opaque
+  align: SubtitleAlign;
+  marginHPct: number;
+  letterSpacing: number;
+  positionPct: number; // bottom edge, % from top
+  zhScale: number;
+  zhColor: string | null;
+}
+
+const DEFAULT_STYLE: SubStyle = {
+  fontFamily: "Noto Sans",
+  fontSize: 48,
+  bold: false,
+  italic: false,
+  textColor: "#FFFFFF",
+  outlineWidth: 3,
+  outlineColor: "#000000",
+  outlineAlpha: 80,
+  shadowDepth: 0,
+  shadowColor: "#000000",
+  bgColor: null,
+  bgOpacity: 75,
+  align: "center",
+  marginHPct: 4,
+  letterSpacing: 0,
+  positionPct: 88,
+  zhScale: 0.8,
+  zhColor: null,
+};
+
+/** One-click looks. Each is a full SubStyle the user can then tweak. */
+const STYLE_PRESETS: { id: string; label: string; style: SubStyle }[] = [
+  { id: "tv", label: "📺 Сонгодог ТВ", style: { ...DEFAULT_STYLE } },
+  {
+    id: "youtube",
+    label: "▶️ YouTube",
+    style: { ...DEFAULT_STYLE, fontFamily: "Noto Sans", fontSize: 44, bgColor: "#000000", bgOpacity: 70, outlineWidth: 1, positionPct: 90 },
+  },
+  {
+    id: "cinema",
+    label: "🎬 Кино шар",
+    style: { ...DEFAULT_STYLE, fontFamily: "PT Sans", fontSize: 52, textColor: "#FFE234", outlineColor: "#1A1A00", outlineWidth: 3, shadowDepth: 1.5, positionPct: 88 },
+  },
+  {
+    id: "minimal",
+    label: "✨ Минимал",
+    style: { ...DEFAULT_STYLE, fontFamily: "Montserrat", fontSize: 40, textColor: "#F5F5F5", outlineWidth: 1, outlineAlpha: 35, positionPct: 92 },
+  },
+  {
+    id: "dual",
+    label: "🌏 Хос хэл",
+    style: { ...DEFAULT_STYLE, fontFamily: "Noto Sans", fontSize: 46, bgColor: "#000000", bgOpacity: 55, outlineWidth: 1.5, positionPct: 86, zhScale: 0.78, zhColor: "#FFD24D" },
+  },
+];
+// "Montserrat" preset falls back gracefully (not bundled) — keep to Noto.
+STYLE_PRESETS[3].style.fontFamily = "Noto Sans";
+
+/**
+ * Pre-filled style instructions for the AI refine card (genre presets).
+ */
+const REFINE_PRESETS: { id: string; label: string; prompt: string }[] = [
+  { id: "news", label: "📰 Мэдээний нэвтрүүлэг", prompt: "Энэ бол албан ёсны мэдээний нэвтрүүлэг. Орчуулгыг objective, цэгцтэй, утга төгс мэдээний өнгөөр зас. Гуравдугаар бие, идэвхтэй өгүүлбэр хэлбэр. Бодит баримт, цаг хугацаа, газар нэрийг үнэн зөв илэрхийл. Хэт яриа, ойр дотно үгсээс зайлсхий." },
+  { id: "documentary", label: "🎥 Баримтат кино", prompt: "Энэ бол баримтат кино. Орчуулгыг өгүүлэгчийн тайван, судалгаатай өнгө аястай болгож зас. Уншиж тайлбарлаж буй мэт цэгцтэй, гэхдээ сэтгэл татах байх. Объектив байдлаа барина." },
+  { id: "horror", label: "👻 Аймшгийн кино", prompt: "Энэ бол аймшгийн кино. Орчуулгыг айдас, түгшүүртэй уур амьсгал төрүүлэх үгсээр зас. Богино, огцом өгүүлбэр ашигла. Чимээгүй айдас, сэжиглэл илэрхийлэх үг сонго." },
+  { id: "comedy", label: "😂 Инээдмийн кино", prompt: "Энэ бол инээдмийн кино. Орчуулгыг хөгжилтэй, инээдтэй, чөлөөт ярианы аястай болго. Slang болон онигоонд ашиглагддаг хэллэг чөлөөтэй ашигла. Хараал, бүдүүлэг үг бичиж болохгүй." },
+  { id: "drama", label: "💔 Драм / Сэтгэл хөдлөм", prompt: "Энэ бол драмын/сэтгэл хөдлөм кино. Орчуулгыг дотоод мэдрэмж, сэтгэлийн гүн илэрхийлэл бүхий үгсээр зас. Зүрхэнд нөлөөлөх, уянгын утгатай үг сонго." },
+  { id: "action", label: "🔥 Адал явдалт (Action)", prompt: "Энэ бол адал явдалт кино. Орчуулгыг эрчимтэй, эрч хүчтэй, богино тушаалт өгүүлбэрээр зас. Өрнөлд тохирох үг сонго. Огцом тушаал ашигла." },
+  { id: "kid", label: "🧸 Хүүхдэд зориулсан", prompt: "Энэ бол хүүхдэд зориулагдсан контент. Орчуулгыг хүүхдийн ойлгох энгийн, найрсаг, эерэг үгсээр зас. Айдас төрүүлэх, ярвигтай үгсээс зайлсхий. Өгүүлбэр богино, ойлгомжтой." },
+  { id: "tutorial", label: "🎓 Хичээл / Туториал", prompt: "Энэ бол сурах хичээл/туториал контент. Орчуулгыг үе шаттай тайлбарласан, ойлгомжтой, заах өнгөөр зас. Техникийн нэр томьёог үндсэн утгаар нь үлдээж болно, тоонуудыг үг болгоно." },
+  { id: "podcast", label: "🎙️ Подкаст / Ярилцлага", prompt: "Энэ бол подкаст эсвэл ярилцлагын бичлэг. Орчуулгыг хоёр хүн дотноор ярьж буй мэт, хагас албан ёсны, ярианы өнгөтэй болго." },
+  { id: "vlog", label: "📱 Влог / Хувийн бичлэг", prompt: "Энэ бол влог эсвэл хувийн бичлэг. Орчуулгыг өөртөө ярьж буй мэт, ил тод, ярианы аястай болго. Эрч хүчтэй, эерэг өнгө аяс." },
+  { id: "custom", label: "✍️ Өөрөө бичих", prompt: "" },
+];
+
+function stepStatus(current: JobStatus, step: JobStatus): "done" | "active" | "pending" {
   const order = PIPELINE_STEPS.map((s) => s.id);
-  // After EDITING, the rest of the pipeline (SYNTHESIZING, MUXING) follows.
-  // DONE means everything done.
   if (current === "DONE") return "done";
   if (current === "FAILED") {
     return order.indexOf(step) <= order.indexOf("EDITING") ? "done" : "pending";
@@ -202,6 +165,14 @@ function stepStatus(
   return "pending";
 }
 
+function hexToRgba(hex: string, alpha01: number): string {
+  const m = hex.replace(/^#/, "");
+  const r = parseInt(m.slice(0, 2), 16);
+  const g = parseInt(m.slice(2, 4), 16);
+  const b = parseInt(m.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha01})`;
+}
+
 export default function JobPage({ params }: { params: { id: string } }) {
   const { id } = params;
   const [job, setJob] = useState<Job | null>(null);
@@ -211,58 +182,55 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const [stylePrompt, setStylePrompt] = useState("");
   const [outputMode, setOutputMode] = useState<OutputMode>("dub");
   const [subtitleText, setSubtitleText] = useState<SubtitleText>("translated");
-  // Default to burning subtitles onto the video — most users uploading a
-  // video expect to see subs ON the video itself, not download a side file.
   const [subtitleBurn, setSubtitleBurn] = useState(true);
-  const [subtitleFontSize, setSubtitleFontSize] = useState(22);
-  const [subtitleTextColor, setSubtitleTextColor] = useState("#FFFFFF");
-  const [subtitleBgColor, setSubtitleBgColor] = useState<string | null>(null);
-  const [subtitlePosition, setSubtitlePosition] =
-    useState<SubtitlePosition>("bottom");
-  // Continuous vertical position: 0 = top of frame, 100 = bottom. Default
-  // 88 matches the classic "lower-third subtitle" placement.
-  const [subtitlePositionPct, setSubtitlePositionPct] = useState(88);
+  const [capTo1080, setCapTo1080] = useState(true);
+
+  const [style, setStyle] = useState<SubStyle>(DEFAULT_STYLE);
+  const [presetId, setPresetId] = useState<string>("tv");
+
   const previewVideoRef = useRef<HTMLVideoElement>(null);
-  const [previewActiveSeg, setPreviewActiveSeg] = useState<Segment | null>(null);
+  const contentRect = useVideoContentRect(previewVideoRef);
+  const activeSeg = useActiveCue(previewVideoRef, segments);
+
   const [refinePresetId, setRefinePresetId] = useState<string>(REFINE_PRESETS[0].id);
   const [refinePrompt, setRefinePrompt] = useState<string>(REFINE_PRESETS[0].prompt);
   const [refining, setRefining] = useState(false);
   const [refineError, setRefineError] = useState("");
-  /**
-   * Snapshot of each segment's translatedText right before refine runs.
-   * Lets us render an "Өмнө:" line under each row so the user can see what
-   * changed, and offer per-row undo (↶) to revert just that segment.
-   */
-  const [previousTranslations, setPreviousTranslations] = useState<
-    Record<string, string>
-  >({});
+  const [previousTranslations, setPreviousTranslations] = useState<Record<string, string>>({});
+  const refineSnapshotRef = useRef<Record<string, string> | null>(null);
+  const wasRefiningRef = useRef(false);
+
   const [downloads, setDownloads] = useState<{ output?: string; subtitle?: string }>({});
   const [previews, setPreviews] = useState<{ input?: string; output?: string }>({});
   const [busy, setBusy] = useState(false);
-  /** segment.id → presigned audio URL, lazily loaded when user clicks ▶︎. */
   const [segmentAudio, setSegmentAudio] = useState<Record<string, string>>({});
 
-  // Polling guards. The poll function below recurses inside a single effect
-  // closure, so reading React state from it would always see the captured
-  // (stale) value — causing /segments and /preview to refire every cycle.
-  // Refs side-step the closure: once a fetch lands, the ref flips true and
-  // subsequent polls skip the call.
   const segmentsLoadedRef = useRef(false);
   const previewsLoadedRef = useRef(false);
   const downloadsLoadedRef = useRef(false);
 
+  const setField = useCallback(<K extends keyof SubStyle>(key: K, val: SubStyle[K]) => {
+    setStyle((s) => ({ ...s, [key]: val }));
+    setPresetId("custom");
+  }, []);
+
+  const applyPreset = (pid: string) => {
+    const p = STYLE_PRESETS.find((x) => x.id === pid);
+    if (!p) return;
+    setStyle({ ...p.style });
+    setPresetId(pid);
+  };
+
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
-    // Slow phases (uploading, ffmpeg) shouldn't be polled aggressively —
-    // they last 10-30+ seconds and the answer rarely changes inside 2s.
     const intervalForStatus = (s: JobStatus): number => {
       switch (s) {
-        case "EXTRACTING": return 5000;
+        case "EXTRACTING": return 4000;
         case "TRANSCRIBING": return 4000;
         case "TRANSLATING": return 3000;
-        case "SYNTHESIZING": return 5000;
-        case "MUXING": return 5000;
+        case "SYNTHESIZING": return 3000;
+        case "MUXING": return 4000;
         default: return 2500;
       }
     };
@@ -273,14 +241,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
         if (cancelled) return;
         setJob(j);
 
-        // Segments — fetch ONCE when we first see a status where they exist.
-        // Subsequent updates flow through user edits / refine and don't need
-        // polling.
         if (
           !segmentsLoadedRef.current &&
-          (j.status === "EDITING" ||
-            j.status === "DONE" ||
-            j.status === "FAILED")
+          (j.status === "EDITING" || j.status === "DONE" || j.status === "FAILED")
         ) {
           const segs = await getSegments(id);
           if (!cancelled) {
@@ -289,12 +252,27 @@ export default function JobPage({ params }: { params: { id: string } }) {
           }
         }
 
+        // Background AI-refine finished → refetch the rewritten segments.
+        if (wasRefiningRef.current && !j.refining) {
+          wasRefiningRef.current = false;
+          setRefining(false);
+          if (j.refineError) setRefineError(j.refineError);
+          getSegments(id)
+            .then((segs) => {
+              if (cancelled) return;
+              if (refineSnapshotRef.current && !j.refineError) {
+                setPreviousTranslations(refineSnapshotRef.current);
+              }
+              setSegments(segs);
+            })
+            .catch(() => void 0);
+        } else if (j.refining) {
+          wasRefiningRef.current = true;
+        }
+
         if (j.status === "DONE") {
           if (!downloadsLoadedRef.current) {
-            const [dl, pv] = await Promise.all([
-              getDownloadUrls(id),
-              getPreviewUrls(id),
-            ]);
+            const [dl, pv] = await Promise.all([getDownloadUrls(id), getPreviewUrls(id)]);
             if (!cancelled) {
               setDownloads(dl);
               setPreviews(pv);
@@ -306,13 +284,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
         }
         if (j.status === "FAILED") return;
 
-        // Surface the input video for preview as soon as it's available,
-        // without re-fetching every poll cycle.
         if (
           !previewsLoadedRef.current &&
-          (j.status === "EDITING" ||
-            j.status === "TRANSCRIBING" ||
-            j.status === "TRANSLATING")
+          (j.status === "EDITING" || j.status === "TRANSCRIBING" || j.status === "TRANSLATING")
         ) {
           getPreviewUrls(id)
             .then((pv) => {
@@ -336,31 +310,12 @@ export default function JobPage({ params }: { params: { id: string } }) {
     };
   }, [id]);
 
-  // Wire the preview video's playback time to the segment list so the
-  // overlay text mirrors what would actually appear at that moment.
-  useEffect(() => {
-    const video = previewVideoRef.current;
-    if (!video || segments.length === 0) return;
-    const onTimeUpdate = () => {
-      const t = video.currentTime;
-      const active = segments.find((s) => t >= s.startSec && t < s.endSec);
-      setPreviewActiveSeg(active ?? null);
-    };
-    video.addEventListener("timeupdate", onTimeUpdate);
-    return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [segments]);
-
-  /** Update local state on every keystroke so the textarea stays in sync
-   *  with state changes (e.g. refine writes new values into segments). */
   const onSegmentLocalEdit = (segId: string, text: string) => {
     setSegments((prev) =>
-      prev.map((s) =>
-        s.id === segId ? { ...s, translatedText: text, edited: true } : s,
-      ),
+      prev.map((s) => (s.id === segId ? { ...s, translatedText: text, edited: true } : s)),
     );
   };
 
-  /** Persist to the backend when the textarea loses focus. */
   const onSegmentBlur = async (segId: string, text: string) => {
     try {
       await updateSegment(segId, text);
@@ -369,9 +324,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   };
 
-  const onPresetChange = (id: string) => {
-    setRefinePresetId(id);
-    const preset = REFINE_PRESETS.find((p) => p.id === id);
+  const onPresetChange = (pid: string) => {
+    setRefinePresetId(pid);
+    const preset = REFINE_PRESETS.find((p) => p.id === pid);
     if (preset) setRefinePrompt(preset.prompt);
   };
 
@@ -382,34 +337,25 @@ export default function JobPage({ params }: { params: { id: string } }) {
       return;
     }
     setRefineError("");
-    setRefining(true);
-    // Snapshot current translations so the UI can render before/after.
     const snapshot: Record<string, string> = {};
-    for (const s of segments) {
-      snapshot[s.id] = s.translatedText ?? "";
-    }
+    for (const s of segments) snapshot[s.id] = s.translatedText ?? "";
+    refineSnapshotRef.current = snapshot;
+    wasRefiningRef.current = true;
+    setRefining(true);
     try {
-      const updated = await refineTranslations(id, prompt);
-      setPreviousTranslations(snapshot);
-      setSegments(updated);
+      await refineTranslations(id, prompt); // runs in background; poll detects completion
     } catch (err) {
-      setRefineError(
-        err instanceof Error ? err.message : "Сайжруулахад алдаа гарлаа",
-      );
-    } finally {
+      wasRefiningRef.current = false;
       setRefining(false);
+      setRefineError(err instanceof Error ? err.message : "Сайжруулахад алдаа гарлаа");
     }
   };
 
-  /** Revert a single segment to its pre-refine translation. */
   const onUndoRefine = async (segId: string) => {
     const prev = previousTranslations[segId];
     if (prev === undefined) return;
-    // Optimistic local update first so the UI snaps back instantly.
     setSegments((cur) =>
-      cur.map((s) =>
-        s.id === segId ? { ...s, translatedText: prev, edited: true } : s,
-      ),
+      cur.map((s) => (s.id === segId ? { ...s, translatedText: prev, edited: true } : s)),
     );
     setPreviousTranslations((cur) => {
       const next = { ...cur };
@@ -423,7 +369,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   };
 
-  /** Discard all pre-refine snapshots — the user is happy with the rewrite. */
   const onAcceptRefine = () => setPreviousTranslations({});
 
   const onRender = async () => {
@@ -433,35 +378,47 @@ export default function JobPage({ params }: { params: { id: string } }) {
         outputMode,
         subtitleText,
         subtitleBurn,
-        subtitleFontSize,
-        subtitleTextColor,
-        subtitleBgColor,
-        subtitlePosition,
-        subtitlePositionPct,
+        capTo1080,
+        subtitleFontFamily: style.fontFamily,
+        subtitleFontSize: style.fontSize,
+        subtitleBold: style.bold,
+        subtitleItalic: style.italic,
+        subtitleTextColor: style.textColor,
+        subtitleOutlineWidth: style.outlineWidth,
+        subtitleOutlineColor: style.outlineColor,
+        subtitleOutlineAlpha: style.outlineAlpha,
+        subtitleShadowDepth: style.shadowDepth,
+        subtitleShadowColor: style.shadowColor,
+        subtitleBgColor: style.bgColor,
+        subtitleBgOpacity: style.bgOpacity,
+        subtitleAlign: style.align,
+        subtitleMarginHPct: style.marginHPct,
+        subtitleLetterSpacing: style.letterSpacing,
+        subtitlePositionPct: style.positionPct,
+        subtitleZhScale: style.zhScale,
+        subtitleZhColor: style.zhColor,
         ...(outputMode === "dub"
           ? { voiceName: voice, ttsProvider, stylePrompt: stylePrompt || undefined }
           : {}),
       });
+      // Reset polling guards so the new render's progress + outputs load.
+      downloadsLoadedRef.current = false;
     } finally {
       setBusy(false);
     }
   };
 
-  // Switching provider resets the voice choice to that provider's default.
   const onTtsProviderChange = (p: "gemini" | "chimege") => {
     setTtsProvider(p);
     setVoice(p === "chimege" ? "FEMALE3v2" : "Kore");
   };
 
-  /** Lazy-fetch a segment's TTS audio URL the first time the user expands it. */
   const loadSegmentAudio = async (segId: string) => {
-    if (segmentAudio[segId]) return; // already loaded
+    if (segmentAudio[segId]) return;
     try {
       const url = await getSegmentAudioUrl(segId);
       setSegmentAudio((prev) => ({ ...prev, [segId]: url }));
     } catch {
-      // No audio yet (job hasn't been rendered). Mark with empty string so
-      // we don't keep retrying on every render.
       setSegmentAudio((prev) => ({ ...prev, [segId]: "" }));
     }
   };
@@ -476,6 +433,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   const isProcessing =
     job.status !== "DONE" && job.status !== "FAILED" && job.status !== "EDITING";
+  const showProgressBar =
+    (job.status === "SYNTHESIZING" || job.status === "MUXING") && (job.progress ?? 0) > 0;
 
   return (
     <>
@@ -508,6 +467,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
             >
               <span className="dot" />
               {STATUS_ICON[job.status]} {STATUS_LABEL[job.status]}
+              {showProgressBar && ` · ${job.progress}%`}
             </span>
           </div>
 
@@ -521,19 +481,41 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 </div>
               );
             })}
-            <div
-              className={`step ${
-                job.status === "DONE" ? "done" : job.status === "FAILED" ? "" : ""
-              }`}
-            >
+            <div className={`step ${job.status === "DONE" ? "done" : ""}`}>
               <div className="step-dot" />
               <span>Бэлэн</span>
             </div>
           </div>
 
-          {isProcessing && (
+          {isProcessing && !showProgressBar && (
             <div className="progress indeterminate" style={{ marginTop: "1rem" }}>
               <div />
+            </div>
+          )}
+          {showProgressBar && (
+            <div style={{ marginTop: "1rem" }}>
+              <div
+                style={{
+                  height: 8,
+                  borderRadius: 4,
+                  background: "rgba(255,255,255,0.08)",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${job.progress}%`,
+                    height: "100%",
+                    background: "linear-gradient(90deg, var(--accent), var(--accent-2))",
+                    transition: "width 0.4s ease",
+                  }}
+                />
+              </div>
+              {job.progressNote && (
+                <p className="muted" style={{ margin: "0.4rem 0 0", fontSize: "0.8rem" }}>
+                  {job.progressNote}
+                </p>
+              )}
             </div>
           )}
         </section>
@@ -549,10 +531,10 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
         {job.status === "EDITING" && previews.input && (
           <section className="card">
-            <h2 className="card-title">Эх видео</h2>
+            <h2 className="card-title">Эх видео · Хадмалын засвар</h2>
             <p className="card-subtitle">
-              Орчуулгыг засах зуураа дэлгэц дээр харж сонсож болно
-              {subtitleBurn && " · видеог тоглуулахад хадмалын харагдац шинэчлэгдэнэ"}
+              Видеог тоглуулахад хадмал яг шарагдах байрлал, фонт, өнгөөрөө харагдана
+              {!subtitleBurn && " · (хадмал шатаахыг асаавал доорх тохиргоо идэвхжинэ)"}
             </p>
             <div
               style={{
@@ -569,24 +551,29 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 controls
                 preload="metadata"
                 playsInline
-                style={{
-                  width: "100%",
-                  display: "block",
-                  maxHeight: 500,
-                }}
+                style={{ width: "100%", display: "block", maxHeight: 500 }}
               />
-              {subtitleBurn && (
+              {subtitleBurn && contentRect && (
                 <SubtitlePreviewOverlay
-                  activeSegment={previewActiveSeg}
+                  rect={contentRect}
+                  style={style}
                   subtitleText={subtitleText}
-                  fontSize={subtitleFontSize}
-                  textColor={subtitleTextColor}
-                  bgColor={subtitleBgColor}
-                  positionPct={subtitlePositionPct}
-                  onPositionChange={setSubtitlePositionPct}
+                  activeSegment={activeSeg}
+                  videoRef={previewVideoRef}
+                  onPositionChange={(pct) => setField("positionPct", pct)}
                 />
               )}
             </div>
+
+            {subtitleBurn && (
+              <SubtitleStylePanel
+                style={style}
+                setField={setField}
+                presetId={presetId}
+                applyPreset={applyPreset}
+                showZh={subtitleText === "both"}
+              />
+            )}
           </section>
         )}
 
@@ -614,42 +601,15 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 }}
               >
                 <span style={{ color: "var(--text-muted)", marginRight: "auto" }}>
-                  📥 SRT-г одоо татаж авах (видеог mux хийхгүй):
+                  📥 SRT-г одоо татаж авах:
                 </span>
-                <a
-                  href={jobSrtDownloadUrl(id, "translated")}
-                  download
-                  className="btn btn-secondary"
-                  style={{
-                    padding: "0.35rem 0.7rem",
-                    fontSize: "0.78rem",
-                    fontWeight: 500,
-                  }}
-                >
+                <a href={jobSrtDownloadUrl(id, "translated")} download className="btn btn-secondary" style={{ padding: "0.35rem 0.7rem", fontSize: "0.78rem", fontWeight: 500 }}>
                   🇲🇳 Монгол
                 </a>
-                <a
-                  href={jobSrtDownloadUrl(id, "source")}
-                  download
-                  className="btn btn-secondary"
-                  style={{
-                    padding: "0.35rem 0.7rem",
-                    fontSize: "0.78rem",
-                    fontWeight: 500,
-                  }}
-                >
+                <a href={jobSrtDownloadUrl(id, "source")} download className="btn btn-secondary" style={{ padding: "0.35rem 0.7rem", fontSize: "0.78rem", fontWeight: 500 }}>
                   🌐 Эх хэл
                 </a>
-                <a
-                  href={jobSrtDownloadUrl(id, "both")}
-                  download
-                  className="btn btn-secondary"
-                  style={{
-                    padding: "0.35rem 0.7rem",
-                    fontSize: "0.78rem",
-                    fontWeight: 500,
-                  }}
-                >
+                <a href={jobSrtDownloadUrl(id, "both")} download className="btn btn-secondary" style={{ padding: "0.35rem 0.7rem", fontSize: "0.78rem", fontWeight: 500 }}>
                   📑 Хос
                 </a>
               </div>
@@ -670,25 +630,10 @@ export default function JobPage({ params }: { params: { id: string } }) {
                   }}
                 >
                   <span>
-                    ✨ <strong>{Object.keys(previousTranslations).length}</strong>{" "}
-                    мөр шинэчлэгдсэн. Доорх "Өмнө:" мөрийг харьцуулж шалгана уу.
+                    ✨ <strong>{Object.keys(previousTranslations).length}</strong> мөр шинэчлэгдсэн.
+                    Доорх "Өмнө:" мөрийг харьцуулж шалгана уу.
                   </span>
-                  <button
-                    type="button"
-                    onClick={onAcceptRefine}
-                    style={{
-                      padding: "0.35rem 0.75rem",
-                      fontSize: "0.8rem",
-                      fontWeight: 600,
-                      border: "1px solid rgba(124, 92, 255, 0.6)",
-                      borderRadius: 6,
-                      background: "rgba(124, 92, 255, 0.2)",
-                      color: "var(--text)",
-                      cursor: "pointer",
-                      boxShadow: "none",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
+                  <button type="button" onClick={onAcceptRefine} style={{ padding: "0.35rem 0.75rem", fontSize: "0.8rem", fontWeight: 600, border: "1px solid rgba(124, 92, 255, 0.6)", borderRadius: 6, background: "rgba(124, 92, 255, 0.2)", color: "var(--text)", cursor: "pointer", boxShadow: "none", whiteSpace: "nowrap" }}>
                     ✓ Бүгдийг хүлээн авах
                   </button>
                 </div>
@@ -698,31 +643,14 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 {segments.map((s) => {
                   const audioUrl = segmentAudio[s.id];
                   const prev = previousTranslations[s.id];
-                  const showDiff =
-                    prev !== undefined && prev !== (s.translatedText ?? "");
+                  const showDiff = prev !== undefined && prev !== (s.translatedText ?? "");
                   return (
                     <div key={s.id} className="segment-row">
                       <div className="segment-time">
                         {formatTime(s.startSec)}
                         <br />→ {formatTime(s.endSec)}
                         {s.audioKey && (
-                          <button
-                            type="button"
-                            onClick={() => loadSegmentAudio(s.id)}
-                            style={{
-                              marginTop: "0.4rem",
-                              padding: "0.25rem 0.5rem",
-                              fontSize: "0.7rem",
-                              fontWeight: 500,
-                              border: "1px solid var(--border)",
-                              borderRadius: 6,
-                              background: "rgba(255,255,255,0.05)",
-                              color: "var(--text-muted)",
-                              cursor: "pointer",
-                              boxShadow: "none",
-                            }}
-                            title="TTS-ийг сонсох"
-                          >
+                          <button type="button" onClick={() => loadSegmentAudio(s.id)} style={{ marginTop: "0.4rem", padding: "0.25rem 0.5rem", fontSize: "0.7rem", fontWeight: 500, border: "1px solid var(--border)", borderRadius: 6, background: "rgba(255,255,255,0.05)", color: "var(--text-muted)", cursor: "pointer", boxShadow: "none" }} title="TTS-ийг сонсох">
                             {audioUrl ? "🔊" : "🎧"}
                           </button>
                         )}
@@ -731,76 +659,18 @@ export default function JobPage({ params }: { params: { id: string } }) {
                       <div className="segment-translated">
                         <textarea
                           value={s.translatedText ?? ""}
-                          onChange={(e) =>
-                            onSegmentLocalEdit(s.id, e.target.value)
-                          }
+                          onChange={(e) => onSegmentLocalEdit(s.id, e.target.value)}
                           onBlur={(e) => onSegmentBlur(s.id, e.target.value)}
                         />
                         {showDiff && (
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "flex-start",
-                              gap: "0.4rem",
-                              marginTop: "0.4rem",
-                              padding: "0.4rem 0.55rem",
-                              background: "rgba(255,255,255,0.03)",
-                              borderLeft: "2px solid rgba(124, 92, 255, 0.5)",
-                              borderRadius: 4,
-                              fontSize: "0.78rem",
-                              color: "var(--text-muted)",
-                              lineHeight: 1.4,
-                            }}
-                          >
-                            <span
-                              style={{
-                                fontWeight: 600,
-                                color: "rgba(124, 92, 255, 0.9)",
-                                flexShrink: 0,
-                              }}
-                            >
-                              Өмнө:
-                            </span>
-                            <span
-                              style={{
-                                flex: 1,
-                                textDecoration: "line-through",
-                                textDecorationColor: "rgba(255,255,255,0.25)",
-                              }}
-                            >
-                              {prev || "(хоосон)"}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => onUndoRefine(s.id)}
-                              title="Энэ мөрийг өмнөх руу буцаах"
-                              style={{
-                                padding: "0.1rem 0.4rem",
-                                fontSize: "0.75rem",
-                                border: "1px solid var(--border)",
-                                borderRadius: 4,
-                                background: "transparent",
-                                color: "var(--text-muted)",
-                                cursor: "pointer",
-                                boxShadow: "none",
-                                flexShrink: 0,
-                              }}
-                            >
-                              ↶ Буцаах
-                            </button>
+                          <div style={{ display: "flex", alignItems: "flex-start", gap: "0.4rem", marginTop: "0.4rem", padding: "0.4rem 0.55rem", background: "rgba(255,255,255,0.03)", borderLeft: "2px solid rgba(124, 92, 255, 0.5)", borderRadius: 4, fontSize: "0.78rem", color: "var(--text-muted)", lineHeight: 1.4 }}>
+                            <span style={{ fontWeight: 600, color: "rgba(124, 92, 255, 0.9)", flexShrink: 0 }}>Өмнө:</span>
+                            <span style={{ flex: 1, textDecoration: "line-through", textDecorationColor: "rgba(255,255,255,0.25)" }}>{prev || "(хоосон)"}</span>
+                            <button type="button" onClick={() => onUndoRefine(s.id)} title="Энэ мөрийг өмнөх рүү буцаах" style={{ padding: "0.1rem 0.4rem", fontSize: "0.75rem", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", color: "var(--text-muted)", cursor: "pointer", boxShadow: "none", flexShrink: 0 }}>↶ Буцаах</button>
                           </div>
                         )}
                         {audioUrl && (
-                          <audio
-                            src={audioUrl}
-                            controls
-                            preload="metadata"
-                            style={{
-                              width: "100%",
-                              marginTop: "0.4rem",
-                              height: 32,
-                            }}
-                          />
+                          <audio src={audioUrl} controls preload="metadata" style={{ width: "100%", marginTop: "0.4rem", height: 32 }} />
                         )}
                       </div>
                     </div>
@@ -812,21 +682,15 @@ export default function JobPage({ params }: { params: { id: string } }) {
             <section className="card">
               <h2 className="card-title">Орчуулга сайжруулах (AI-аар)</h2>
               <p className="card-subtitle">
-                Контентийн төрлийг сонгоход AI үг хэллэг, аяс, өгүүлбэрийн
-                бүтцийг тухайн жанрд тохируулан дахин боловсруулна
+                Контентийн төрлийг сонгоход AI үг хэллэг, аяс, өгүүлбэрийн бүтцийг тухайн
+                жанрд тохируулан дахин боловсруулна
               </p>
 
               <label>
                 <span>Контентийн төрөл</span>
-                <select
-                  value={refinePresetId}
-                  onChange={(e) => onPresetChange(e.target.value)}
-                  disabled={refining}
-                >
+                <select value={refinePresetId} onChange={(e) => onPresetChange(e.target.value)} disabled={refining}>
                   {REFINE_PRESETS.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.label}
-                    </option>
+                    <option key={p.id} value={p.id}>{p.label}</option>
                   ))}
                 </select>
               </label>
@@ -837,323 +701,96 @@ export default function JobPage({ params }: { params: { id: string } }) {
                   value={refinePrompt}
                   onChange={(e) => {
                     setRefinePrompt(e.target.value);
-                    // User started editing → switch the dropdown to "custom"
-                    // so the next preset click doesn't silently overwrite.
                     if (refinePresetId !== "custom") {
-                      const current = REFINE_PRESETS.find(
-                        (p) => p.id === refinePresetId,
-                      );
-                      if (current && current.prompt !== e.target.value) {
-                        setRefinePresetId("custom");
-                      }
+                      const current = REFINE_PRESETS.find((p) => p.id === refinePresetId);
+                      if (current && current.prompt !== e.target.value) setRefinePresetId("custom");
                     }
                   }}
                   disabled={refining}
                   rows={5}
                   placeholder="Жишээ нь: Орчуулгыг илүү хөгжилтэй, инээдэмтэй болгож зас..."
-                  style={{
-                    width: "100%",
-                    resize: "vertical",
-                    fontFamily: "inherit",
-                  }}
+                  style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
                 />
               </label>
 
-              <button
-                type="button"
-                className="btn"
-                onClick={onRefine}
-                disabled={refining || refinePrompt.trim().length < 3}
-                style={{ width: "100%" }}
-              >
-                {refining
-                  ? "✨ Сайжруулж байна..."
-                  : "✨ Орчуулга сайжруулах"}
+              <button type="button" className="btn" onClick={onRefine} disabled={refining || refinePrompt.trim().length < 3} style={{ width: "100%" }}>
+                {refining ? "✨ Сайжруулж байна... (хүлээнэ үү)" : "✨ Орчуулга сайжруулах"}
               </button>
 
               {refineError && (
-                <p className="error-text" style={{ marginTop: "0.75rem" }}>
-                  ❌ {refineError}
-                </p>
+                <p className="error-text" style={{ marginTop: "0.75rem" }}>❌ {refineError}</p>
               )}
             </section>
 
             {job.inputKey && (
-            <section className="card">
-              <h2 className="card-title">Гаргалтын тохиргоо</h2>
-              <p className="card-subtitle">
-                Монгол дуугаар дубляж хийх эсвэл зөвхөн хадмал гаргах
-              </p>
+              <section className="card">
+                <h2 className="card-title">Гаргалтын тохиргоо</h2>
+                <p className="card-subtitle">Монгол дуугаар дубляж хийх эсвэл зөвхөн хадмал гаргах</p>
 
-              <label>
-                <span>Гаргах төрөл</span>
-                <select
-                  value={outputMode}
-                  onChange={(e) => setOutputMode(e.target.value as OutputMode)}
-                >
-                  <option value="dub">
-                    🎬 Дубляж — монгол дуу (хадмал нэмж болно)
-                  </option>
-                  <option value="subtitle">
-                    📄 Зөвхөн хадмал — эх дуу хэвээр, TTS-гүй
-                  </option>
-                </select>
-              </label>
+                <label>
+                  <span>Гаргах төрөл</span>
+                  <select value={outputMode} onChange={(e) => setOutputMode(e.target.value as OutputMode)}>
+                    <option value="dub">🎬 Дубляж — монгол дуу (хадмал нэмж болно)</option>
+                    <option value="subtitle">📄 Зөвхөн хадмал — эх дуу хэвээр, TTS-гүй</option>
+                  </select>
+                </label>
 
-              {outputMode === "dub" && (
-                <>
-                  <label>
-                    <span>TTS engine</span>
-                    <select
-                      value={ttsProvider}
-                      onChange={(e) =>
-                        onTtsProviderChange(e.target.value as "gemini" | "chimege")
-                      }
-                    >
-                      <option value="chimege">
-                        Chimege (mongol-native, чанартай) ⭐
-                      </option>
-                      <option value="gemini">Gemini 3.1 Flash TTS</option>
-                    </select>
-                  </label>
-
-                  <label>
-                    <span>Хоолой</span>
-                    <select value={voice} onChange={(e) => setVoice(e.target.value)}>
-                      {(ttsProvider === "chimege" ? CHIMEGE_VOICES : GEMINI_VOICES).map(
-                        (v) => (
-                          <option key={v.value} value={v.value}>
-                            {v.label}
-                          </option>
-                        ),
-                      )}
-                    </select>
-                  </label>
-
-                  {ttsProvider === "gemini" && (
+                {outputMode === "dub" && (
+                  <>
                     <label>
-                      <span>Style instructions (optional)</span>
-                      <input
-                        type="text"
-                        value={stylePrompt}
-                        onChange={(e) => setStylePrompt(e.target.value)}
-                        placeholder="Read warmly like a storyteller"
-                      />
+                      <span>TTS engine</span>
+                      <select value={ttsProvider} onChange={(e) => onTtsProviderChange(e.target.value as "gemini" | "chimege")}>
+                        <option value="chimege">Chimege (монгол, чанартай) ⭐</option>
+                        <option value="gemini">Gemini Flash TTS</option>
+                      </select>
                     </label>
-                  )}
-                </>
-              )}
 
-              <label>
-                <span>Хадмалын текст</span>
-                <select
-                  value={subtitleText}
-                  onChange={(e) => setSubtitleText(e.target.value as SubtitleText)}
-                >
-                  <option value="translated">Монгол орчуулга</option>
-                  <option value="source">Эх хэл (хятад)</option>
-                  <option value="both">Хос (хятад + монгол)</option>
-                </select>
-              </label>
+                    <label>
+                      <span>Хоолой</span>
+                      <select value={voice} onChange={(e) => setVoice(e.target.value)}>
+                        {(ttsProvider === "chimege" ? CHIMEGE_VOICES : GEMINI_VOICES).map((v) => (
+                          <option key={v.value} value={v.value}>{v.label}</option>
+                        ))}
+                      </select>
+                    </label>
 
-              <label>
-                <span>Хадмалыг хаана гаргах</span>
-                <select
-                  value={subtitleBurn ? "burn" : "file"}
-                  onChange={(e) => setSubtitleBurn(e.target.value === "burn")}
-                >
-                  <option value="burn">
-                    🔥 Видеон дээр шатаах — хадмал видеотойгоо нэг файл болж харагдана (+SRT)
-                  </option>
-                  <option value="file">
-                    📄 Зөвхөн SRT файл — видеон дээр харагдахгүй, тусдаа татна
-                  </option>
-                </select>
-              </label>
-              {!subtitleBurn && (
-                <p
-                  className="card-subtitle"
-                  style={{
-                    marginTop: "-0.25rem",
-                    marginBottom: "0.5rem",
-                    padding: "0.5rem 0.75rem",
-                    background: "rgba(255, 200, 0, 0.08)",
-                    border: "1px solid rgba(255, 200, 0, 0.3)",
-                    borderRadius: 4,
-                    fontSize: "0.78rem",
-                  }}
-                >
-                  ⚠️ Анхааруулга: эцсийн видео дээр хадмал{" "}
-                  <strong>харагдахгүй</strong>. Зөвхөн SRT файлыг тусдаа татаж
-                  VLC/Premiere/YouTube-д оруулж ашиглана.
-                </p>
-              )}
-
-              {subtitleBurn && (
-                <>
-                  <p
-                    className="card-subtitle"
-                    style={{ marginTop: "0.25rem", marginBottom: "0.25rem" }}
-                  >
-                    Хадмалын харагдац — дээрх видеогоо тоглуулж жинхэнэ
-                    харагдацыг шалгана уу
-                  </p>
-
-                  <label>
-                    <span>Үсгийн хэмжээ ({subtitleFontSize}px)</span>
-                    <input
-                      type="range"
-                      min={12}
-                      max={48}
-                      step={1}
-                      value={subtitleFontSize}
-                      onChange={(e) =>
-                        setSubtitleFontSize(Number(e.target.value))
-                      }
-                      style={{ width: "100%" }}
-                    />
-                  </label>
-
-                  <label>
-                    <span>Үсгийн өнгө</span>
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: "0.5rem",
-                        alignItems: "center",
-                      }}
-                    >
-                      <input
-                        type="color"
-                        value={subtitleTextColor}
-                        onChange={(e) => setSubtitleTextColor(e.target.value)}
-                        style={{
-                          width: 48,
-                          height: 36,
-                          padding: 0,
-                          border: "1px solid var(--border)",
-                          borderRadius: 6,
-                          background: "transparent",
-                          cursor: "pointer",
-                        }}
-                      />
-                      <code
-                        style={{
-                          fontSize: "0.85rem",
-                          color: "var(--text-muted)",
-                        }}
-                      >
-                        {subtitleTextColor.toUpperCase()}
-                      </code>
-                    </div>
-                  </label>
-
-                  <label>
-                    <span>Дэвсгэрийн өнгө</span>
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: "0.5rem",
-                        alignItems: "center",
-                      }}
-                    >
-                      <label
-                        style={{
-                          display: "flex",
-                          gap: "0.35rem",
-                          alignItems: "center",
-                          fontSize: "0.85rem",
-                          color: "var(--text-muted)",
-                          marginBottom: 0,
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={subtitleBgColor !== null}
-                          onChange={(e) =>
-                            setSubtitleBgColor(
-                              e.target.checked ? "#000000" : null,
-                            )
-                          }
-                        />
-                        Дэвсгэртэй
+                    {ttsProvider === "gemini" && (
+                      <label>
+                        <span>Style instructions (optional)</span>
+                        <input type="text" value={stylePrompt} onChange={(e) => setStylePrompt(e.target.value)} placeholder="Read warmly like a storyteller" />
                       </label>
-                      <input
-                        type="color"
-                        value={subtitleBgColor ?? "#000000"}
-                        onChange={(e) => setSubtitleBgColor(e.target.value)}
-                        disabled={subtitleBgColor === null}
-                        style={{
-                          width: 48,
-                          height: 36,
-                          padding: 0,
-                          border: "1px solid var(--border)",
-                          borderRadius: 6,
-                          background: "transparent",
-                          cursor:
-                            subtitleBgColor === null ? "not-allowed" : "pointer",
-                          opacity: subtitleBgColor === null ? 0.4 : 1,
-                        }}
-                      />
-                      <code
-                        style={{
-                          fontSize: "0.85rem",
-                          color: "var(--text-muted)",
-                        }}
-                      >
-                        {subtitleBgColor
-                          ? subtitleBgColor.toUpperCase()
-                          : "(өнгөгүй, зөвхөн контур)"}
-                      </code>
-                    </div>
-                  </label>
+                    )}
+                  </>
+                )}
 
-                  <label>
-                    <span>
-                      Босоо байрлал ({subtitlePositionPct}% — дээр 0 ↔ 100 доор)
-                    </span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={subtitlePositionPct}
-                      onChange={(e) =>
-                        setSubtitlePositionPct(Number(e.target.value))
-                      }
-                      style={{ width: "100%" }}
-                    />
-                    <span
-                      className="muted"
-                      style={{
-                        display: "block",
-                        fontSize: "0.75rem",
-                        marginTop: "0.25rem",
-                      }}
-                    >
-                      Preview видеон дээрх хадмалыг хулганаар дээш доош зөөж
-                      ч болно.
-                    </span>
-                  </label>
-                </>
-              )}
+                <label>
+                  <span>Хадмалын текст</span>
+                  <select value={subtitleText} onChange={(e) => setSubtitleText(e.target.value as SubtitleText)}>
+                    <option value="translated">Монгол орчуулга</option>
+                    <option value="source">Эх хэл (хятад)</option>
+                    <option value="both">Хос (хятад + монгол)</option>
+                  </select>
+                </label>
 
-              <button
-                type="button"
-                className="btn btn-large"
-                onClick={onRender}
-                disabled={busy}
-                style={{ width: "100%" }}
-              >
-                {busy
-                  ? "..."
-                  : outputMode === "dub"
-                    ? "🎬 Видеог үүсгэх"
-                    : subtitleBurn
-                      ? "📄 Хадмалтай видео гаргах"
-                      : "📄 Хадмал (SRT) гаргах"}
-              </button>
-            </section>
+                <label>
+                  <span>Хадмалыг хаана гаргах</span>
+                  <select value={subtitleBurn ? "burn" : "file"} onChange={(e) => setSubtitleBurn(e.target.value === "burn")}>
+                    <option value="burn">🔥 Видеон дээр шатаах — нэг файл (+SRT). Дээрх preview-гээр загварыг тааруулна</option>
+                    <option value="file">📄 Зөвхөн SRT файл — видеон дээр харагдахгүй</option>
+                  </select>
+                </label>
+
+                {subtitleBurn && (
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    <input type="checkbox" checked={capTo1080} onChange={(e) => setCapTo1080(e.target.checked)} style={{ width: "auto" }} />
+                    <span style={{ marginBottom: 0 }}>1080p болгож шахах (4K видеог хурдан шарна)</span>
+                  </label>
+                )}
+
+                <button type="button" className="btn btn-large" onClick={onRender} disabled={busy} style={{ width: "100%", marginTop: "0.75rem" }}>
+                  {busy ? "..." : outputMode === "dub" ? "🎬 Видеог үүсгэх" : subtitleBurn ? "📄 Хадмалтай видео гаргах" : "📄 Хадмал (SRT) гаргах"}
+                </button>
+              </section>
             )}
           </>
         )}
@@ -1164,31 +801,15 @@ export default function JobPage({ params }: { params: { id: string } }) {
             <p className="card-subtitle">Видеогоо доор шууд үзэж сонсох боломжтой</p>
 
             {previews.output && (
-              <video
-                src={previews.output}
-                controls
-                preload="metadata"
-                playsInline
-                style={{
-                  width: "100%",
-                  borderRadius: "var(--radius-sm)",
-                  background: "#000",
-                  marginBottom: "1rem",
-                  maxHeight: 600,
-                }}
-              />
+              <video src={previews.output} controls preload="metadata" playsInline style={{ width: "100%", borderRadius: "var(--radius-sm)", background: "#000", marginBottom: "1rem", maxHeight: 600 }} />
             )}
 
             <div className="row" style={{ marginTop: "0.75rem" }}>
               {downloads.output && (
-                <a href={downloads.output} download className="btn">
-                  ⬇️ Видео
-                </a>
+                <a href={downloads.output} download className="btn">⬇️ Видео</a>
               )}
               {downloads.subtitle && (
-                <a href={downloads.subtitle} download className="btn btn-secondary">
-                  ⬇️ Subtitle (srt)
-                </a>
+                <a href={downloads.subtitle} download className="btn btn-secondary">⬇️ Subtitle (srt)</a>
               )}
             </div>
           </section>
@@ -1204,132 +825,470 @@ function formatTime(sec: number): string {
   return `${m}:${s.padStart(4, "0")}`;
 }
 
-/**
- * Live overlay on top of the input video that mirrors how the burned-in
- * subtitle will look. Text comes from whatever segment is active at the
- * current playback time; if none, a static sample is shown so the user can
- * still see styling changes when the video is paused.
- *
- * The overlay is draggable vertically — mouse-down + drag updates
- * `positionPct` (0-100% from top of video) so the user can position the
- * subtitle by feel rather than only via the slider.
- */
+/* ─── Preview scaling: the letterboxed video content rect ────────────────── */
+interface ContentRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+function useVideoContentRect(
+  videoRef: React.RefObject<HTMLVideoElement>,
+): ContentRect | null {
+  const [rect, setRect] = useState<ContentRect | null>(null);
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const compute = () => {
+      const vw = v.videoWidth;
+      const vh = v.videoHeight;
+      const ew = v.clientWidth;
+      const eh = v.clientHeight;
+      if (!vw || !vh || !ew || !eh) return;
+      // object-fit lets the browser fit the video inside the element; we
+      // replicate the contain math to find the actual picture rectangle.
+      const scale = Math.min(ew / vw, eh / vh);
+      const cw = vw * scale;
+      const ch = vh * scale;
+      setRect({ left: (ew - cw) / 2, top: (eh - ch) / 2, width: cw, height: ch });
+    };
+    const ro = new ResizeObserver(compute);
+    ro.observe(v);
+    v.addEventListener("loadedmetadata", compute);
+    compute();
+    return () => {
+      ro.disconnect();
+      v.removeEventListener("loadedmetadata", compute);
+    };
+  }, [videoRef]);
+  return rect;
+}
+
+/* ─── Active cue tracking (frame-accurate, with paused/seek support) ─────── */
+function useActiveCue(
+  videoRef: React.RefObject<HTMLVideoElement>,
+  segments: Segment[],
+): Segment | null {
+  const [active, setActive] = useState<Segment | null>(null);
+  const sorted = useMemo(
+    () => [...segments].sort((a, b) => a.startSec - b.startSec),
+    [segments],
+  );
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || sorted.length === 0) return;
+    let vfcId = 0;
+    let rafId = 0;
+    let stopped = false;
+
+    const find = (t: number): Segment | null => {
+      let lo = 0;
+      let hi = sorted.length - 1;
+      let ans: Segment | null = null;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (sorted[mid].startSec <= t) {
+          if (t < sorted[mid].endSec) ans = sorted[mid];
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      return ans;
+    };
+
+    const tick = () => {
+      if (stopped) return;
+      const seg = find(v.currentTime);
+      setActive((prev) => (prev?.id === seg?.id ? prev : seg));
+      schedule();
+    };
+    const schedule = () => {
+      // requestVideoFrameCallback fires per presented frame (incl. after a seek
+      // while paused) → frame-exact, unlike the ~4Hz 'timeupdate' event.
+      const anyV = v as HTMLVideoElement & {
+        requestVideoFrameCallback?: (cb: () => void) => number;
+      };
+      if (typeof anyV.requestVideoFrameCallback === "function") {
+        vfcId = anyV.requestVideoFrameCallback(tick);
+      } else {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+    tick(); // initial paint
+    const onSeek = () => tick();
+    v.addEventListener("seeked", onSeek);
+    return () => {
+      stopped = true;
+      v.removeEventListener("seeked", onSeek);
+      const anyV = v as HTMLVideoElement & {
+        cancelVideoFrameCallback?: (id: number) => void;
+      };
+      if (vfcId && anyV.cancelVideoFrameCallback) anyV.cancelVideoFrameCallback(vfcId);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [videoRef, sorted]);
+  return active;
+}
+
+/* ─── Subtitle preview overlay (matches the burned .ass) ─────────────────── */
 function SubtitlePreviewOverlay({
-  activeSegment,
+  rect,
+  style,
   subtitleText,
-  fontSize,
-  textColor,
-  bgColor,
-  positionPct,
+  activeSegment,
+  videoRef,
   onPositionChange,
 }: {
-  activeSegment: Segment | null;
+  rect: ContentRect;
+  style: SubStyle;
   subtitleText: SubtitleText;
-  fontSize: number;
-  textColor: string;
-  bgColor: string | null;
-  positionPct: number;
+  activeSegment: Segment | null;
+  videoRef: React.RefObject<HTMLVideoElement>;
   onPositionChange: (pct: number) => void;
 }) {
-  const fallbackSource = "示例字幕";
-  const fallbackTranslated = "Энэ бол жишээ хадмал";
-  const source = activeSegment?.sourceText?.trim() || fallbackSource;
-  const translated =
-    activeSegment?.translatedText?.trim() || fallbackTranslated;
-
-  const lines: string[] =
-    subtitleText === "source"
-      ? [source]
-      : subtitleText === "both"
-        ? [source, translated]
-        : [translated];
-
-  // No-background mode → simulate libass outline via multi-direction text-shadow.
-  const outlineShadow =
-    "1px 1px 2px rgba(0,0,0,0.95), -1px 1px 2px rgba(0,0,0,0.95), " +
-    "1px -1px 2px rgba(0,0,0,0.95), -1px -1px 2px rgba(0,0,0,0.95), " +
-    "0 0 4px rgba(0,0,0,0.6)";
-
+  // Hooks must run unconditionally (before any early return).
+  const dragRef = useRef<{ startY: number; moved: boolean } | null>(null);
   const [dragging, setDragging] = useState(false);
 
-  // Convert a clientY position (during drag) to a 0-100 percentage relative
-  // to the parent video container. We pull the parent from the event target's
-  // ancestor — works regardless of video size / window scroll.
-  const updateFromEvent = (
-    clientY: number,
-    container: HTMLElement | null,
-  ) => {
-    if (!container) return;
-    const rect = container.getBoundingClientRect();
-    if (rect.height === 0) return;
-    const raw = ((clientY - rect.top) / rect.height) * 100;
-    const clamped = Math.max(0, Math.min(100, Math.round(raw)));
-    onPositionChange(clamped);
-  };
+  const fallbackZh = "示例字幕 Өө Үү";
+  const fallbackMn = "Энэ бол жишээ хадмал";
+  const zhRaw = activeSegment?.sourceText?.trim();
+  const mnRaw = activeSegment?.translatedText?.trim();
+  const isSample = !activeSegment;
+  const zh = zhRaw || (isSample ? fallbackZh : "");
+  const mn = mnRaw || (isSample ? fallbackMn : "");
 
-  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragging(true);
-    const container = e.currentTarget.parentElement;
+  // Same scale the backend uses: value(px@1080) * actualHeight/1080.
+  const scale = rect.height / SUBTITLE_REF_HEIGHT;
+  const mainPx = style.fontSize * scale;
+  const zhPx = mainPx * style.zhScale;
+  const outlinePx = style.outlineWidth * scale;
+  const spacingPx = style.letterSpacing * scale;
+  const shadowPx = style.shadowDepth * scale;
+
+  const outlineRgba = hexToRgba(style.outlineColor, style.outlineAlpha / 100);
+  const textShadow = style.bgColor
+    ? "none"
+    : buildOutlineShadow(outlinePx, outlineRgba, shadowPx, style.shadowColor);
+
+  const lines: { text: string; cjk: boolean; px: number; color: string }[] = [];
+  if (subtitleText === "source") {
+    lines.push({ text: zh, cjk: true, px: mainPx, color: style.textColor });
+  } else if (subtitleText === "both") {
+    if (zh) lines.push({ text: zh, cjk: true, px: zhPx, color: style.zhColor ?? style.textColor });
+    if (mn) lines.push({ text: mn, cjk: false, px: mainPx, color: style.textColor });
+  } else {
+    lines.push({ text: mn, cjk: false, px: mainPx, color: style.textColor });
+  }
+  if (lines.every((l) => !l.text)) return null;
+
+  // ── drag-to-position (on the text block only; threshold avoids click-jack) ──
+  const clientYToPct = (clientY: number) => {
+    const v = videoRef.current;
+    if (!v) return style.positionPct;
+    const elRect = v.getBoundingClientRect();
+    const yInContent = clientY - (elRect.top + rect.top);
+    return Math.max(0, Math.min(100, Math.round((yInContent / rect.height) * 100)));
+  };
+  const onPointerDown = (e: React.PointerEvent) => {
+    dragRef.current = { startY: e.clientY, moved: false };
     (e.target as Element).setPointerCapture?.(e.pointerId);
-    updateFromEvent(e.clientY, container);
   };
-
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragging) return;
-    updateFromEvent(e.clientY, e.currentTarget.parentElement);
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    if (!d.moved && Math.abs(e.clientY - d.startY) < 4) return; // ignore tiny jitter / plain clicks
+    d.moved = true;
+    setDragging(true);
+    onPositionChange(clientYToPct(e.clientY));
   };
-
-  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+  const endDrag = (e: React.PointerEvent) => {
+    dragRef.current = null;
     setDragging(false);
     (e.target as Element).releasePointerCapture?.(e.pointerId);
   };
 
   return (
     <div
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
       style={{
         position: "absolute",
-        left: 0,
-        right: 0,
-        top: `${positionPct}%`,
-        transform: "translateY(-50%)",
-        textAlign: "center",
-        padding: "0 4%",
-        cursor: dragging ? "grabbing" : "grab",
-        userSelect: "none",
-        touchAction: "none",
-        // While not dragging, allow clicks to pass through to the video so
-        // play/pause works as usual. Drag flips to grab and captures pointer.
-        pointerEvents: "auto",
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        pointerEvents: "none",
+        overflow: "hidden",
       }}
-      title="Хулганаар дээш доош чирж зөөнө үү"
     >
-      <span
+      <div
         style={{
-          display: "inline-block",
-          color: textColor,
-          fontSize: `${fontSize}px`,
-          lineHeight: 1.25,
-          fontWeight: 600,
-          letterSpacing: "0.01em",
-          backgroundColor: bgColor ?? "transparent",
-          padding: bgColor ? "4px 12px" : 0,
-          borderRadius: bgColor ? 4 : 0,
-          textShadow: bgColor ? "none" : outlineShadow,
-          whiteSpace: "pre-line",
-          maxWidth: "92%",
-          outline: dragging
-            ? "1px dashed rgba(124, 92, 255, 0.6)"
-            : "none",
-          outlineOffset: 4,
+          position: "absolute",
+          left: `${style.marginHPct}%`,
+          right: `${style.marginHPct}%`,
+          top: `${style.positionPct}%`,
+          transform: "translateY(-100%)", // bottom-anchored, like ASS Alignment=2
+          textAlign: style.align,
+          pointerEvents: "none",
         }}
       >
-        {lines.join("\n")}
-      </span>
+        <span
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          title="Чирж дээш доош зөөнө үү"
+          style={{
+            display: "inline-block",
+            pointerEvents: "auto",
+            cursor: dragging ? "grabbing" : "grab",
+            userSelect: "none",
+            touchAction: "none",
+            fontWeight: style.bold ? 700 : 400,
+            fontStyle: style.italic ? "italic" : "normal",
+            letterSpacing: `${spacingPx}px`,
+            lineHeight: 1.2,
+            backgroundColor: style.bgColor ? hexToRgba(style.bgColor, style.bgOpacity / 100) : "transparent",
+            padding: style.bgColor ? `${Math.max(2, outlinePx)}px ${Math.max(6, outlinePx * 2.5)}px` : 0,
+            maxWidth: "100%",
+            outline: dragging ? "1px dashed rgba(124,92,255,0.7)" : "none",
+            outlineOffset: 3,
+          }}
+        >
+          {lines.map((l, i) => (
+            <div
+              key={i}
+              style={{
+                fontFamily: l.cjk
+                  ? `'Noto Sans SC', '${style.fontFamily}', sans-serif`
+                  : `'${style.fontFamily}', 'Noto Sans', sans-serif`,
+                fontSize: `${l.px}px`,
+                color: l.color,
+                textShadow,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {l.text}
+            </div>
+          ))}
+          {isSample && (
+            <div
+              style={{
+                fontSize: `${Math.max(9, mainPx * 0.32)}px`,
+                color: "rgba(255,255,255,0.55)",
+                fontFamily: "var(--font-inter), sans-serif",
+                textShadow: "none",
+                fontWeight: 400,
+                letterSpacing: 0,
+                marginTop: 2,
+              }}
+            >
+              жишээ
+            </div>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** Build a multi-direction text-shadow that approximates a libass outline (+ optional drop shadow). */
+function buildOutlineShadow(
+  outlinePx: number,
+  outlineRgba: string,
+  shadowPx: number,
+  shadowColor: string,
+): string {
+  const parts: string[] = [];
+  if (outlinePx > 0.1) {
+    const r = outlinePx;
+    for (let a = 0; a < 360; a += 45) {
+      const dx = (Math.cos((a * Math.PI) / 180) * r).toFixed(2);
+      const dy = (Math.sin((a * Math.PI) / 180) * r).toFixed(2);
+      parts.push(`${dx}px ${dy}px 0 ${outlineRgba}`);
+    }
+  }
+  if (shadowPx > 0.1) {
+    parts.push(`${shadowPx.toFixed(2)}px ${shadowPx.toFixed(2)}px ${(shadowPx * 1.5).toFixed(2)}px ${hexToRgba(shadowColor, 0.65)}`);
+  }
+  return parts.length ? parts.join(", ") : "none";
+}
+
+/* ─── Style controls (live next to the video) ────────────────────────────── */
+function SubtitleStylePanel({
+  style,
+  setField,
+  presetId,
+  applyPreset,
+  showZh,
+}: {
+  style: SubStyle;
+  setField: <K extends keyof SubStyle>(key: K, val: SubStyle[K]) => void;
+  presetId: string;
+  applyPreset: (id: string) => void;
+  showZh: boolean;
+}) {
+  const swatch = (value: string, onChange: (v: string) => void, disabled = false) => (
+    <input
+      type="color"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+      style={{ width: 40, height: 32, padding: 0, border: "1px solid var(--border)", borderRadius: 6, background: "transparent", cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.4 : 1 }}
+    />
+  );
+
+  return (
+    <div style={{ marginTop: "1rem", paddingTop: "1rem", borderTop: "1px solid var(--border)" }}>
+      {/* Presets */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginBottom: "0.9rem" }}>
+        {STYLE_PRESETS.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => applyPreset(p.id)}
+            style={{
+              padding: "0.35rem 0.7rem",
+              fontSize: "0.78rem",
+              fontWeight: 600,
+              borderRadius: 999,
+              cursor: "pointer",
+              boxShadow: "none",
+              border: presetId === p.id ? "1px solid var(--border-glow)" : "1px solid var(--border)",
+              background: presetId === p.id ? "var(--accent-soft)" : "rgba(255,255,255,0.04)",
+              color: "var(--text)",
+            }}
+          >
+            {p.label}
+          </button>
+        ))}
+        {presetId === "custom" && (
+          <span style={{ alignSelf: "center", fontSize: "0.75rem", color: "var(--text-subtle)" }}>· өөрчилсөн</span>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem 1.25rem" }}>
+        <label>
+          <span>Фонт</span>
+          <select value={style.fontFamily} onChange={(e) => setField("fontFamily", e.target.value)}>
+            {SUBTITLE_FONTS.map((f) => (
+              <option key={f.value} value={f.value} style={{ fontFamily: `'${f.value}'` }}>{f.label}</option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          <span>Үсгийн хэмжээ ({style.fontSize}px)</span>
+          <input type="range" min={20} max={120} step={1} value={style.fontSize} onChange={(e) => setField("fontSize", Number(e.target.value))} style={{ width: "100%" }} />
+        </label>
+
+        <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+          <label style={{ display: "flex", gap: "0.35rem", alignItems: "center", marginBottom: 0 }}>
+            <input type="checkbox" checked={style.bold} onChange={(e) => setField("bold", e.target.checked)} style={{ width: "auto" }} />
+            <span style={{ marginBottom: 0, fontWeight: 700 }}>Bold</span>
+          </label>
+          <label style={{ display: "flex", gap: "0.35rem", alignItems: "center", marginBottom: 0 }}>
+            <input type="checkbox" checked={style.italic} onChange={(e) => setField("italic", e.target.checked)} style={{ width: "auto" }} />
+            <span style={{ marginBottom: 0, fontStyle: "italic" }}>Italic</span>
+          </label>
+        </div>
+
+        <label>
+          <span>Зэрэгцүүлэлт</span>
+          <div style={{ display: "flex", gap: "0.3rem" }}>
+            {(["left", "center", "right"] as SubtitleAlign[]).map((a) => (
+              <button key={a} type="button" onClick={() => setField("align", a)} style={{ flex: 1, padding: "0.4rem", fontSize: "0.8rem", borderRadius: 6, cursor: "pointer", boxShadow: "none", border: style.align === a ? "1px solid var(--border-glow)" : "1px solid var(--border)", background: style.align === a ? "var(--accent-soft)" : "rgba(255,255,255,0.04)", color: "var(--text)" }}>
+                {a === "left" ? "⬅" : a === "center" ? "⬛" : "➡"}
+              </button>
+            ))}
+          </div>
+        </label>
+
+        <label>
+          <span>Үсгийн өнгө</span>
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+            {swatch(style.textColor, (v) => setField("textColor", v))}
+            <code style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{style.textColor.toUpperCase()}</code>
+          </div>
+        </label>
+
+        <label>
+          <span>Контурын зузаан ({style.outlineWidth})</span>
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+            <input type="range" min={0} max={8} step={0.5} value={style.outlineWidth} onChange={(e) => setField("outlineWidth", Number(e.target.value))} style={{ flex: 1 }} />
+            {swatch(style.outlineColor, (v) => setField("outlineColor", v))}
+          </div>
+        </label>
+
+        <label>
+          <span>Контурын тунгалаг ({style.outlineAlpha}%)</span>
+          <input type="range" min={0} max={100} step={5} value={style.outlineAlpha} onChange={(e) => setField("outlineAlpha", Number(e.target.value))} style={{ width: "100%" }} />
+        </label>
+
+        <label>
+          <span>Сүүдэр ({style.shadowDepth}){style.bgColor ? " — дэвсгэртэй үед идэвхгүй" : ""}</span>
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+            <input type="range" min={0} max={6} step={0.5} value={style.shadowDepth} disabled={!!style.bgColor} onChange={(e) => setField("shadowDepth", Number(e.target.value))} style={{ flex: 1, opacity: style.bgColor ? 0.4 : 1 }} />
+            {swatch(style.shadowColor, (v) => setField("shadowColor", v), !!style.bgColor)}
+          </div>
+        </label>
+
+        <label>
+          <span>Дэвсгэр хайрцаг</span>
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+            <label style={{ display: "flex", gap: "0.3rem", alignItems: "center", marginBottom: 0, fontSize: "0.82rem", color: "var(--text-muted)" }}>
+              <input type="checkbox" checked={style.bgColor !== null} onChange={(e) => setField("bgColor", e.target.checked ? "#000000" : null)} style={{ width: "auto" }} />
+              Асаах
+            </label>
+            {swatch(style.bgColor ?? "#000000", (v) => setField("bgColor", v), style.bgColor === null)}
+          </div>
+        </label>
+
+        {style.bgColor !== null && (
+          <label>
+            <span>Хайрцгийн тунгалаг ({style.bgOpacity}%)</span>
+            <input type="range" min={0} max={100} step={5} value={style.bgOpacity} onChange={(e) => setField("bgOpacity", Number(e.target.value))} style={{ width: "100%" }} />
+          </label>
+        )}
+
+        <label>
+          <span>Хажуугийн зай ({style.marginHPct}%)</span>
+          <input type="range" min={0} max={30} step={1} value={style.marginHPct} onChange={(e) => setField("marginHPct", Number(e.target.value))} style={{ width: "100%" }} />
+        </label>
+
+        <label>
+          <span>Үсэг хоорондын зай ({style.letterSpacing})</span>
+          <input type="range" min={-1} max={8} step={0.5} value={style.letterSpacing} onChange={(e) => setField("letterSpacing", Number(e.target.value))} style={{ width: "100%" }} />
+        </label>
+
+        <label style={{ gridColumn: "1 / -1" }}>
+          <span>Босоо байрлал ({style.positionPct}% — дээр 0 ↔ доор 100)</span>
+          <input type="range" min={0} max={100} step={1} value={style.positionPct} onChange={(e) => setField("positionPct", Number(e.target.value))} style={{ width: "100%" }} />
+          <span className="muted" style={{ display: "block", fontSize: "0.74rem", marginTop: "0.2rem" }}>
+            Preview видеон дээрх хадмалыг чирж зөөж ч болно.
+          </span>
+        </label>
+
+        {showZh && (
+          <>
+            <label>
+              <span>Хятад мөрийн хэмжээ ({Math.round(style.zhScale * 100)}%)</span>
+              <input type="range" min={40} max={120} step={2} value={Math.round(style.zhScale * 100)} onChange={(e) => setField("zhScale", Number(e.target.value) / 100)} style={{ width: "100%" }} />
+            </label>
+            <label>
+              <span>Хятад мөрийн өнгө</span>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                <label style={{ display: "flex", gap: "0.3rem", alignItems: "center", marginBottom: 0, fontSize: "0.82rem", color: "var(--text-muted)" }}>
+                  <input type="checkbox" checked={style.zhColor !== null} onChange={(e) => setField("zhColor", e.target.checked ? "#FFD24D" : null)} style={{ width: "auto" }} />
+                  Тусгай
+                </label>
+                {swatch(style.zhColor ?? "#FFD24D", (v) => setField("zhColor", v), style.zhColor === null)}
+              </div>
+            </label>
+          </>
+        )}
+      </div>
     </div>
   );
 }

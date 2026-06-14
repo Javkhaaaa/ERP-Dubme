@@ -3,9 +3,9 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { readFile } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import type { Readable } from "node:stream";
 import { config } from "./config.js";
@@ -37,33 +37,33 @@ const s3 = new S3Client({
 const BUCKET = config.s3.bucket;
 
 /**
- * Upload a local file to object storage. Returns the object key.
- *
- * We read the file into a Buffer instead of streaming because some S3-compatible
- * gateways (including Storj's) strictly require `Content-Length`, and AWS SDK v3
- * doesn't always propagate it for stream bodies — even when ContentLength is set
- * explicitly.
- *
- * Trade-off: holds the whole file in memory. For our pipeline the largest is the
- * extracted audio WAV (~32KB/sec at 16kHz mono), so a 1-hour video = ~115MB.
- * If we ever need to support multi-hour uploads, switch to @aws-sdk/lib-storage's
- * `Upload` class which handles multipart automatically.
+ * Upload a local file to object storage via streamed multipart upload
+ * (@aws-sdk/lib-storage). This:
+ *   • streams from disk — no whole-file Buffer in RAM (the old readFile path
+ *     spiked RSS by the full file size and outright THREW ERR_FS_FILE_TOO_LARGE
+ *     at ≥2 GiB, hard-failing large burned outputs);
+ *   • uploads 4 parts in parallel for ~2-4x throughput on the final video;
+ *   • sets explicit per-part Content-Length, satisfying strict gateways
+ *     (Storj/DO Spaces) without us computing it.
+ * Returns the object key.
  */
 export async function uploadFile(
   localPath: string,
   key: string,
   contentType: string,
 ): Promise<string> {
-  const data = await readFile(localPath);
-  await s3.send(
-    new PutObjectCommand({
+  const upload = new Upload({
+    client: s3,
+    params: {
       Bucket: BUCKET,
       Key: key,
-      Body: data,
+      Body: createReadStream(localPath),
       ContentType: contentType,
-      ContentLength: data.length,
-    }),
-  );
+    },
+    partSize: 32 * 1024 * 1024, // 32 MB parts (lib-storage uses a single PUT for smaller bodies)
+    queueSize: 4,               // up to 4 parts in flight
+  });
+  await upload.done();
   return key;
 }
 

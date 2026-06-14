@@ -617,9 +617,14 @@ button:not(.btn):not(.btn-secondary):disabled {
 }
 
 .segment-source {
-  font-size: 0.92rem;
+  /* Chinese source text — use a real CJK stack so Han glyphs are consistent
+     across macOS / Windows / Linux instead of relying on the page font's
+     fallback. Slightly larger + looser leading suits CJK at the same point. */
+  font-family: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", var(--font-inter), sans-serif;
+  font-size: 1rem;
   color: var(--text-muted);
-  line-height: 1.5;
+  line-height: 1.65;
   padding-top: 0.5rem;
 }
 
@@ -627,8 +632,50 @@ button:not(.btn):not(.btn-secondary):disabled {
   width: 100%;
   min-height: 56px;
   resize: vertical;
-  font-size: 0.92rem;
-  line-height: 1.45;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+/* ─── Bundled subtitle fonts ─────────────────────────────────────────────
+ * The SAME .ttf files the backend burns with (served from /public/fonts), so
+ * the live subtitle preview matches the burned output's glyph shapes, weights
+ * and wrapping — not an approximation in the page font. */
+@font-face {
+  font-family: "Noto Sans";
+  src: url("/fonts/NotoSans-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Noto Sans";
+  src: url("/fonts/NotoSans-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "PT Sans";
+  src: url("/fonts/PTSans-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "PT Sans";
+  src: url("/fonts/PTSans-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Noto Serif";
+  src: url("/fonts/NotoSerif-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  /* Chinese line in the subtitle preview (matches backend Noto Sans SC). */
+  font-family: "Noto Sans SC";
+  src: url("/fonts/NotoSansSC-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
 }
 
 /* ─── Misc ───────────────────────────────────────────────────────────── */

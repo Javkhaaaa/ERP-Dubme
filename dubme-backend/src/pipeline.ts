@@ -1,5 +1,8 @@
-import { stat, writeFile } from "node:fs/promises";
-import { unlinkSync } from "node:fs";
+import { stat, writeFile, mkdir, rename, rm } from "node:fs/promises";
+import { existsSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
+import type { Job } from "@prisma/client";
 import { JobStatus } from "@prisma/client";
 import { prisma } from "./db.js";
 import {
@@ -10,19 +13,25 @@ import {
   uploadFile,
 } from "./storage.js";
 import {
-  burnSubtitles,
+  burnAss,
+  type BurnCue,
   type BurnSubtitleStyle,
-  extractAudio,
+  DEFAULT_BURN_STYLE,
   extractAudioCompressed,
+  mapPool,
   mixSegmentsToTimeline,
   probeDuration,
+  probeVideoMeta,
   replaceAudioTrack,
   sliceAudio,
+  SUBTITLE_REF_HEIGHT,
   tmpPath,
+  writeAss,
   writeSrt,
 } from "./ffmpeg.js";
 import { transcribe, type SttResult, type SttSegment } from "./clients/groq-stt.js";
 import {
+  downloadAudio as ytDlpAudio,
   downloadVideo as ytDlpDownload,
   hasYtDlp,
   looksLikeStreamingSite,
@@ -38,175 +47,263 @@ import { synthesizeChimege } from "./clients/chimege-tts.js";
  *     [optional EDITING pause] →
  *   SYNTHESIZING → MUXING → DONE
  *
- * Each step updates Job.status so the UI can poll progress.
- * On any error we set status=FAILED and store errorMessage.
- *
- * The functions below are intentionally separate so the route layer can
- * `pause` after translating (set status=EDITING) and resume later when
- * the user has reviewed the translations.
+ * Each step updates Job.status (and Job.progress / progressNote during the long
+ * SYNTHESIZING/MUXING phases) so the UI can show movement, not just a frozen
+ * spinner. On any error we set status=FAILED and store errorMessage.
  */
+
+/* ─── Per-job local cache ────────────────────────────────────────────────
+ * The source video is needed twice — by STT (extract audio) and by render —
+ * with the unbounded EDITING pause in between. The old code downloaded it from
+ * S3, deleted it, then downloaded the identical bytes AGAIN at render time
+ * (minutes of pure waste on a multi-GB file). We now keep one copy in a
+ * jobId-keyed cache that both phases reuse; a background sweep removes stale
+ * dirs so disk doesn't grow without bound.
+ */
+const CACHE_ROOT = join(tmpdir(), "dubme-cache");
+
+function cacheDir(jobId: string): string {
+  return join(CACHE_ROOT, jobId);
+}
+
+async function ensureCacheDir(jobId: string): Promise<string> {
+  const dir = cacheDir(jobId);
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+/** Remove a job's cache dir. Called when a job reaches a terminal state. */
+export async function cleanupJobCache(jobId: string): Promise<void> {
+  await rm(cacheDir(jobId), { recursive: true, force: true }).catch(() => void 0);
+}
 
 /**
- * Step 0 (URL-import flow only): fetch the user-supplied video URL straight
- * into object storage. Sets status=DOWNLOADING during the fetch and stamps
- * `inputKey` on the job so the rest of the pipeline behaves as if the file
- * had been browser-uploaded. Streaming throughout — never holds the full
- * video in RAM.
+ * Sweep cache dirs older than `maxAgeHours`. Call on server start and on a
+ * timer so abandoned EDITING jobs don't keep their videos on disk forever.
  */
-export async function runImportFromUrl(
-  jobId: string,
-  url: string,
-): Promise<void> {
-  console.log(`[pipeline] job=${jobId} → DOWNLOADING from URL`);
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: JobStatus.DOWNLOADING },
-  });
-
-  const useYtDlp = looksLikeStreamingSite(url);
-
-  // Direct-file URLs keep their extension; yt-dlp always produces mp4.
-  const urlExt = useYtDlp
-    ? "mp4"
-    : (() => {
-        try {
-          const p = new URL(url).pathname.toLowerCase();
-          const m = p.match(/\.(mp4|mov|webm|mkv|m4v)$/);
-          return m ? m[1] : "mp4";
-        } catch {
-          return "mp4";
-        }
-      })();
-
-  const tmpVideo = tmpPath(urlExt);
+export async function sweepStaleCache(maxAgeHours = 24): Promise<void> {
   try {
-    if (useYtDlp) {
-      if (!(await hasYtDlp())) {
-        throw new Error(
-          "YouTube/Bilibili/Vimeo зэрэг сайтаас татахын тулд yt-dlp суулгасан " +
-            "байх ёстой. macOS дээр: `brew install yt-dlp`. Дараа сервер restart хийнэ үү.",
-        );
-      }
-      console.log(`[pipeline] job=${jobId} using yt-dlp for ${url}`);
-      await ytDlpDownload(url, tmpVideo);
-    } else {
-      const { contentType } = await downloadUrlToFile(url, tmpVideo);
-      if (
-        !contentType.startsWith("video/") &&
-        !contentType.startsWith("application/octet-stream")
-      ) {
-        throw new Error(
-          `URL-ийн агуулга видео биш байна (Content-Type: ${contentType}). ` +
-            `Энэ нь streaming page магадгүй — yt-dlp руу шилжихийн тулд ` +
-            `host-ийг STREAMING_HOST_RE-д нэмж өгнө үү.`,
-        );
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(CACHE_ROOT).catch(() => [] as string[]);
+    const cutoff = Date.now() - maxAgeHours * 3600_000;
+    for (const name of entries) {
+      const dir = join(CACHE_ROOT, name);
+      const s = await stat(dir).catch(() => null);
+      if (s && s.mtimeMs < cutoff) {
+        await rm(dir, { recursive: true, force: true }).catch(() => void 0);
+        console.log(`[cache] swept stale ${name}`);
       }
     }
-
-    const fileStat = await stat(tmpVideo);
-    console.log(
-      `[pipeline] job=${jobId} downloaded ${fileStat.size} bytes from URL`,
-    );
-
-    // Re-upload to S3 under the canonical input key so the rest of the
-    // pipeline finds it where it expects.
-    const inputKey = `jobs/${jobId}/input.${urlExt}`;
-    await uploadFile(tmpVideo, inputKey, "video/mp4");
-
-    await prisma.job.update({
-      where: { id: jobId },
-      data: { inputKey },
-    });
-  } finally {
-    safeUnlink(tmpVideo);
+  } catch {
+    /* best-effort */
   }
 }
 
-/** Steps 1+2: pull video → extract audio → STT → save segments. */
+/* ─── Background video import registry ───────────────────────────────────
+ * For URL-import jobs we fetch the (small) audio first so STT + translation —
+ * everything needed to reach EDITING and download an SRT — start immediately,
+ * while the full video downloads in the BACKGROUND. Render later awaits this
+ * promise so the video is guaranteed present before muxing.
+ */
+const videoImports = new Map<string, Promise<void>>();
+
+/** Resolve once a job's background video import (if any) has finished. */
+export function awaitVideoImport(jobId: string): Promise<void> {
+  return videoImports.get(jobId) ?? Promise.resolve();
+}
+
+/**
+ * Kick off (and register) a background download of the full video → S3.
+ * Streaming sites go through yt-dlp (≤1080p mp4); direct URLs stream to disk.
+ * Failures are logged but do NOT fail the job — an SRT-only user never needs
+ * the video; a render attempt will surface a clear error if it's missing.
+ */
+function startVideoImport(jobId: string, url: string): void {
+  const p = (async () => {
+    const dir = await ensureCacheDir(jobId);
+    const cachePathLocal = join(dir, "input.mp4");
+    const useYtDlp = looksLikeStreamingSite(url);
+    if (useYtDlp) {
+      if (!(await hasYtDlp())) {
+        throw new Error("yt-dlp not installed — cannot import streaming video");
+      }
+      await ytDlpDownload(url, cachePathLocal);
+    } else {
+      await downloadUrlToFile(url, cachePathLocal);
+    }
+    const inputKey = `jobs/${jobId}/input.mp4`;
+    await uploadFile(cachePathLocal, inputKey, "video/mp4");
+    await prisma.job.update({ where: { id: jobId }, data: { inputKey } });
+    console.log(`[pipeline] job=${jobId} background video import complete`);
+  })().catch((err) => {
+    console.error(`[pipeline] job=${jobId} background video import FAILED:`, err);
+  });
+  videoImports.set(jobId, p);
+  // Drop the entry once it settles so the map doesn't grow without bound.
+  // (Late awaiters then get a resolved Promise and fall back to the cache/S3.)
+  void p.finally(() => videoImports.delete(jobId));
+}
+
+/**
+ * Ensure the source video is on local disk (cache hit → instant; otherwise
+ * download from S3 once). Also waits for any in-flight background import so the
+ * render path never races a still-downloading video.
+ */
+async function ensureLocalVideo(jobId: string): Promise<string> {
+  await awaitVideoImport(jobId);
+  const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
+  if (!job.inputKey) {
+    throw new Error("Видео бэлэн биш байна — татаж дуусаагүй эсвэл алдаа гарсан.");
+  }
+  const dir = await ensureCacheDir(jobId);
+  const local = join(dir, `input${extname(job.inputKey) || ".mp4"}`);
+  if (existsSync(local) && (await stat(local)).size > 0) return local;
+  const tmp = `${local}.part`;
+  await downloadToFile(job.inputKey, tmp);
+  await rename(tmp, local);
+  return local;
+}
+
+/* ─── STT (shared back-half) ─────────────────────────────────────────────── */
+
+const STT_MAX_FILE_BYTES = 20 * 1024 * 1024; // headroom under Groq's 25 MB
+const STT_CHUNK_SECONDS = 600; // 10 min per chunk
+const STT_CONCURRENCY = 4;
+
+/**
+ * Transcribe an already-extracted Opus file and persist Segment rows.
+ * Shared by the browser-upload path (runStt) and the URL audio-first path.
+ */
+async function transcribeAndSaveSegments(
+  jobId: string,
+  audioOggPath: string,
+  sourceLanguage: string | undefined,
+): Promise<void> {
+  // Push extracted audio to storage so it's reusable (e.g. editor preview).
+  const audioKey = `jobs/${jobId}/audio.ogg`;
+  const audioUpload = uploadFile(audioOggPath, audioKey, "audio/ogg");
+
+  console.log(`[pipeline] job=${jobId} → TRANSCRIBING (lang hint=${sourceLanguage})`);
+  await prisma.job.update({
+    where: { id: jobId },
+    data: { status: JobStatus.TRANSCRIBING, audioKey },
+  });
+
+  const stt = await transcribeAudioFile(audioOggPath, sourceLanguage, jobId);
+  await audioUpload; // make sure the preview audio landed
+  console.log(
+    `[stt] job=${jobId} detected=${stt.language} segments=${stt.segments.length} ` +
+      `fullText="${stt.fullText.slice(0, 120)}${stt.fullText.length > 120 ? "..." : ""}"`,
+  );
+
+  let rows = stt.segments.map((s, idx) => ({
+    jobId,
+    sequence: idx,
+    startSec: s.start,
+    endSec: s.end,
+    sourceText: s.text,
+  }));
+  if (rows.length === 0 && stt.fullText.trim()) {
+    const duration = await probeDuration(audioOggPath);
+    rows = [{ jobId, sequence: 0, startSec: 0, endSec: duration, sourceText: stt.fullText.trim() }];
+  }
+  if (rows.length === 0) {
+    throw new Error(
+      "Аудионд яриа таниагүй. Видео чимээгүй эсвэл хэт чанар муу байж магад. Өөр видео туршаарай.",
+    );
+  }
+  await prisma.segment.deleteMany({ where: { jobId } });
+  await prisma.segment.createMany({ data: rows });
+}
+
+/** Browser-upload / S3 path: pull video (cached) → extract audio → STT. */
 export async function runStt(jobId: string): Promise<void> {
   const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
   if (!job.inputKey) throw new Error("Job has no inputKey");
 
-  // 1. Download source video to /tmp.
-  const videoPath = tmpPath("mp4");
   const audioPath = tmpPath("ogg");
   try {
     console.log(`[pipeline] job=${jobId} → EXTRACTING`);
-    await prisma.job.update({
-      where: { id: jobId },
-      data: { status: JobStatus.EXTRACTING },
-    });
-    await downloadToFile(job.inputKey, videoPath);
-    const videoStat = await stat(videoPath);
-    console.log(`[pipeline] job=${jobId} downloaded ${videoStat.size} bytes`);
+    await prisma.job.update({ where: { id: jobId }, data: { status: JobStatus.EXTRACTING } });
 
-    // 2. Extract compressed mono Opus for STT (~5× smaller than 16kHz WAV;
-    //    same transcription quality). Lets longer videos fit Whisper's
-    //    file-size cap in one call.
+    const videoPath = await ensureLocalVideo(jobId);
+    const videoStat = await stat(videoPath);
+    console.log(`[pipeline] job=${jobId} local video ${videoStat.size} bytes`);
+
     await extractAudioCompressed(videoPath, audioPath);
     const audioStat = await stat(audioPath);
     console.log(`[pipeline] job=${jobId} extracted audio ${audioStat.size} bytes`);
 
-    // 3. Push extracted audio to storage so it's reusable.
-    const audioKey = `jobs/${jobId}/audio.ogg`;
-    await uploadFile(audioPath, audioKey, "audio/ogg");
-
-    // 4. Transcribe with Groq Whisper. Letting language auto-detect tends to be
-    // more reliable than forcing — Whisper figures Chinese out from the audio.
-    // For long videos the audio is auto-chunked so we don't blow past Groq's
-    // 25 MB per-request cap.
-    console.log(`[pipeline] job=${jobId} → TRANSCRIBING (lang hint=${job.sourceLanguage})`);
-    await prisma.job.update({
-      where: { id: jobId },
-      data: { status: JobStatus.TRANSCRIBING, audioKey },
-    });
-    const stt = await transcribeAudioFile(audioPath, job.sourceLanguage, jobId);
-    console.log(
-      `[stt] job=${jobId} detected=${stt.language} segments=${stt.segments.length} ` +
-        `fullText="${stt.fullText.slice(0, 120)}${stt.fullText.length > 120 ? "..." : ""}"`,
-    );
-
-    // 5. Persist segments. Some videos return no segment-level timestamps —
-    // fall back to a single segment covering the whole audio if we have any text.
-    let rows = stt.segments.map((s, idx) => ({
-      jobId,
-      sequence: idx,
-      startSec: s.start,
-      endSec: s.end,
-      sourceText: s.text,
-    }));
-    if (rows.length === 0 && stt.fullText.trim()) {
-      const duration = await probeDuration(audioPath);
-      rows = [{
-        jobId,
-        sequence: 0,
-        startSec: 0,
-        endSec: duration,
-        sourceText: stt.fullText.trim(),
-      }];
-    }
-    if (rows.length === 0) {
-      throw new Error(
-        "Аудионд яриа таниагүй. Видео чимээгүй эсвэл хэт чанар муу байж магад. Өөр видео туршаарай.",
-      );
-    }
-    await prisma.segment.deleteMany({ where: { jobId } });
-    await prisma.segment.createMany({ data: rows });
+    await transcribeAndSaveSegments(jobId, audioPath, job.sourceLanguage);
   } finally {
-    safeUnlink(videoPath);
     safeUnlink(audioPath);
   }
 }
 
 /**
- * Groq's audio endpoint caps single uploads at 25 MB. At our 48 kbps Opus
- * setting that's ~70 min of audio — anything longer is auto-split into
- * ≤10-min chunks here. Stream-copy slicing is cheap (no re-encode), so
- * the only added cost is N extra Whisper calls.
+ * URL-import fast path: download ONLY the audio (tiny vs the full video) and
+ * run STT immediately, while the full video downloads in the background. This
+ * is what makes "import a 2-hour video → get an SRT" finish in minutes instead
+ * of waiting on a multi-GB video download first.
  */
-const STT_MAX_FILE_BYTES = 20 * 1024 * 1024; // headroom under Groq's 25 MB
-const STT_CHUNK_SECONDS = 600; // 10 min — safely under the limit at 48 kbps
+export async function runUrlImportAndStt(jobId: string, url: string): Promise<void> {
+  const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
 
+  // Background: fetch the full video → S3 (only needed if the user renders).
+  startVideoImport(jobId, url);
+
+  const useYtDlp = looksLikeStreamingSite(url);
+  const dir = await ensureCacheDir(jobId);
+  const audioOgg = tmpPath("ogg");
+  try {
+    console.log(`[pipeline] job=${jobId} → DOWNLOADING audio`);
+    await prisma.job.update({ where: { id: jobId }, data: { status: JobStatus.DOWNLOADING } });
+
+    let rawAudio: string;
+    if (useYtDlp) {
+      if (!(await hasYtDlp())) {
+        throw new Error(
+          "YouTube/Bilibili/Vimeo зэрэг сайтаас татахын тулд yt-dlp суулгасан " +
+            "байх ёстой. macOS дээр: `brew install yt-dlp`.",
+        );
+      }
+      rawAudio = await ytDlpAudio(url, join(dir, "audio-src"));
+    } else {
+      // Direct file URL — there's no separate audio-only stream to fetch, so
+      // we must use the full file. Wait for the background import to finish
+      // writing the cached copy (avoids two writers racing on the same path),
+      // then extract audio from it. (No early-STT win here, but direct-file
+      // URLs are the rare case; the audio-only fast path is for streaming.)
+      await awaitVideoImport(jobId);
+      const cached = join(dir, "input.mp4");
+      if (!existsSync(cached)) {
+        // Background import failed — fetch our own copy so STT can proceed.
+        await downloadUrlToFile(url, cached);
+      }
+      rawAudio = cached;
+    }
+
+    await prisma.job.update({ where: { id: jobId }, data: { status: JobStatus.EXTRACTING } });
+    await extractAudioCompressed(rawAudio, audioOgg);
+    if (useYtDlp) safeUnlink(rawAudio); // the .opus source; keep direct-file cache
+
+    await transcribeAndSaveSegments(jobId, audioOgg, job.sourceLanguage);
+  } finally {
+    safeUnlink(audioOgg);
+  }
+}
+
+/** for /jobs/from-srt: no STT (segments preloaded) — just import the video. */
+export function importVideoForJob(jobId: string, url: string): void {
+  startVideoImport(jobId, url);
+}
+
+/**
+ * Groq caps single uploads at 25 MB. Longer audio is split into ≤10-min
+ * chunks. The chunks are fully independent (language is pinned from the job's
+ * sourceLanguage), so we slice them all up front and transcribe with bounded
+ * concurrency instead of one-at-a-time.
+ */
 async function transcribeAudioFile(
   audioPath: string,
   language: string | undefined,
@@ -221,58 +318,43 @@ async function transcribeAudioFile(
   const numChunks = Math.ceil(totalDur / STT_CHUNK_SECONDS);
   console.log(
     `[stt] job=${jobId} audio ${(audioStat.size / 1024 / 1024).toFixed(1)}MB / ` +
-      `${totalDur.toFixed(0)}s → splitting into ${numChunks} chunks`,
+      `${totalDur.toFixed(0)}s → ${numChunks} chunks @ concurrency ${STT_CONCURRENCY}`,
   );
 
-  const allSegments: SttSegment[] = [];
-  const textParts: string[] = [];
-  let detectedLanguage = language;
-
-  for (let i = 0; i < numChunks; i++) {
+  const indices = Array.from({ length: numChunks }, (_, i) => i);
+  const perChunk = await mapPool(indices, STT_CONCURRENCY, async (i) => {
     const chunkStart = i * STT_CHUNK_SECONDS;
     const chunkDur = Math.min(STT_CHUNK_SECONDS, totalDur - chunkStart);
     const chunkPath = tmpPath("ogg");
     try {
       await sliceAudio(audioPath, chunkStart, chunkDur, chunkPath);
-      // Subsequent chunks reuse the language detected from the first chunk —
-      // forcing it avoids Whisper switching mid-video on quiet sections.
-      const chunkResult = await transcribe(
-        chunkPath,
-        detectedLanguage ?? language,
-      );
+      const res = await transcribe(chunkPath, language);
       console.log(
-        `[stt] job=${jobId} chunk ${i + 1}/${numChunks} ` +
-          `(${chunkStart.toFixed(0)}-${(chunkStart + chunkDur).toFixed(0)}s) ` +
-          `→ ${chunkResult.segments.length} segments`,
+        `[stt] job=${jobId} chunk ${i + 1}/${numChunks} → ${res.segments.length} segments`,
       );
-      detectedLanguage = detectedLanguage ?? chunkResult.language;
-      if (chunkResult.fullText.trim()) textParts.push(chunkResult.fullText.trim());
-      for (const seg of chunkResult.segments) {
-        allSegments.push({
-          start: seg.start + chunkStart,
-          end: seg.end + chunkStart,
-          text: seg.text,
-        });
-      }
+      return { i, chunkStart, res };
     } finally {
       safeUnlink(chunkPath);
     }
-  }
+  });
 
-  return {
-    language: detectedLanguage ?? "",
-    fullText: textParts.join(" "),
-    segments: allSegments,
-  };
+  const allSegments: SttSegment[] = [];
+  const textParts: string[] = [];
+  let detectedLanguage = language;
+  for (const { chunkStart, res } of perChunk) {
+    detectedLanguage = detectedLanguage ?? res.language;
+    if (res.fullText.trim()) textParts.push(res.fullText.trim());
+    for (const seg of res.segments) {
+      allSegments.push({ start: seg.start + chunkStart, end: seg.end + chunkStart, text: seg.text });
+    }
+  }
+  return { language: detectedLanguage ?? "", fullText: textParts.join(" "), segments: allSegments };
 }
 
 /** Step 3: machine-translate sourceText → translatedText for all segments. */
 export async function runTranslate(jobId: string): Promise<void> {
   const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: JobStatus.TRANSLATING },
-  });
+  await prisma.job.update({ where: { id: jobId }, data: { status: JobStatus.TRANSLATING } });
 
   const segments = await prisma.segment.findMany({
     where: { jobId },
@@ -286,35 +368,82 @@ export async function runTranslate(jobId: string): Promise<void> {
     job.targetLanguage,
   );
 
-  await prisma.$transaction(
-    translated.map((text, idx) =>
-      prisma.segment.update({
-        where: { id: segments[idx].id },
-        data: { translatedText: text },
-      }),
-    ),
+  await bulkUpdateTranslations(
+    segments.map((s, i) => ({ id: s.id, text: translated[i] ?? "" })),
   );
 
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: JobStatus.EDITING },
-  });
+  await prisma.job.update({ where: { id: jobId }, data: { status: JobStatus.EDITING } });
+}
+
+/**
+ * Persist N translations in ONE round-trip instead of N sequential UPDATEs
+ * inside a transaction (which cost N×RTT to the DB — minutes when the backend
+ * is far from Supabase). UPDATE … FROM (unnest(...)) does it in a single query.
+ */
+export async function bulkUpdateTranslations(
+  rows: { id: string; text: string }[],
+  clearEdited = false,
+): Promise<void> {
+  if (rows.length === 0) return;
+  const ids = rows.map((r) => r.id);
+  const texts = rows.map((r) => r.text);
+  if (clearEdited) {
+    await prisma.$executeRaw`
+      UPDATE "Segment" AS s
+      SET "translatedText" = v.txt, "edited" = false, "updatedAt" = now()
+      FROM (SELECT unnest(${ids}::text[]) AS id, unnest(${texts}::text[]) AS txt) AS v
+      WHERE s.id = v.id`;
+  } else {
+    await prisma.$executeRaw`
+      UPDATE "Segment" AS s
+      SET "translatedText" = v.txt, "updatedAt" = now()
+      FROM (SELECT unnest(${ids}::text[]) AS id, unnest(${texts}::text[]) AS txt) AS v
+      WHERE s.id = v.id`;
+  }
+}
+
+/* ─── Render ─────────────────────────────────────────────────────────────── */
+
+type SubtitleText = "translated" | "source" | "both";
+
+/** Build a complete BurnSubtitleStyle from the Job row (with safe defaults). */
+function buildBurnStyle(job: Job): BurnSubtitleStyle {
+  const d = DEFAULT_BURN_STYLE;
+  return {
+    fontFamily: job.subtitleFontFamily ?? d.fontFamily,
+    fontSize: job.subtitleFontSize ?? d.fontSize,
+    bold: job.subtitleBold ?? d.bold,
+    italic: job.subtitleItalic ?? d.italic,
+    textColor: job.subtitleTextColor ?? d.textColor,
+    outlineWidth: job.subtitleOutlineWidth ?? d.outlineWidth,
+    outlineColor: job.subtitleOutlineColor ?? d.outlineColor,
+    outlineAlpha: job.subtitleOutlineAlpha ?? d.outlineAlpha,
+    shadowDepth: job.subtitleShadowDepth ?? d.shadowDepth,
+    shadowColor: job.subtitleShadowColor ?? d.shadowColor,
+    bgColor: job.subtitleBgColor ?? d.bgColor,
+    bgOpacity: job.subtitleBgOpacity ?? d.bgOpacity,
+    align: (job.subtitleAlign as BurnSubtitleStyle["align"]) ?? d.align,
+    marginHPct: job.subtitleMarginHPct ?? d.marginHPct,
+    letterSpacing: job.subtitleLetterSpacing ?? d.letterSpacing,
+    positionPct: job.subtitlePositionPct ?? d.positionPct,
+    zhScale: job.subtitleZhScale ?? d.zhScale,
+    zhColor: job.subtitleZhColor ?? d.zhColor,
+  };
 }
 
 /** Steps 4+5: TTS each segment → mix on timeline → mux back into video. */
 export async function runRender(jobId: string): Promise<void> {
   const job = await prisma.job.findUniqueOrThrow({ where: { id: jobId } });
-  if (!job.inputKey) throw new Error("Job has no inputKey");
+  if (!job.inputKey && job.outputMode !== "subtitle") {
+    // subtitle-only can technically run from-srt-only (no video), but burning
+    // needs a video; the route guards that. Dub always needs a video.
+  }
 
   const outputMode = job.outputMode === "subtitle" ? "subtitle" : "dub";
   const subtitleText = (job.subtitleText ?? "translated") as SubtitleText;
   const burn = job.subtitleBurn ?? false;
-  const burnStyle: BurnSubtitleStyle = {
-    fontSize: job.subtitleFontSize ?? 22,
-    textColor: job.subtitleTextColor ?? "#FFFFFF",
-    bgColor: job.subtitleBgColor ?? null,
-    positionPct: job.subtitlePositionPct ?? 88,
-  };
+  const style = buildBurnStyle(job);
+  const capTo1080 = job.capTo1080 ?? true;
 
   const segments = await prisma.segment.findMany({
     where: { jobId },
@@ -322,173 +451,182 @@ export async function runRender(jobId: string): Promise<void> {
   });
   if (segments.length === 0) throw new Error("No segments to render");
 
-  // Dubbing always needs the translation (TTS speaks it); a subtitle that
-  // shows the translation needs it too. A source-only subtitle does not.
+  // Translation gaps shouldn't nuke a long render: gap-fill (in the translator)
+  // makes blanks rare, and the synthesis/cue builders already skip empty lines.
+  // So only FAIL if essentially everything is missing (a real upstream failure);
+  // otherwise warn and let the few blank segments simply go un-dubbed/un-subbed.
   const needsTranslation = outputMode === "dub" || subtitleText !== "source";
   if (needsTranslation) {
-    for (const s of segments) {
-      if (!s.translatedText) {
-        throw new Error(`Segment ${s.sequence} missing translatedText`);
+    const missing = segments.filter((s) => !s.translatedText?.trim()).length;
+    if (missing > 0) {
+      const ratio = missing / segments.length;
+      console.warn(
+        `[render] job=${jobId} ${missing}/${segments.length} segments missing translation`,
+      );
+      if (ratio > 0.5) {
+        throw new Error(
+          `Орчуулга дутуу байна (${missing}/${segments.length} мөр орчуулагдаагүй). ` +
+            `Орчуулгыг дахин ажиллуулна уу.`,
+        );
       }
     }
   }
 
-  const cues = buildSubtitleCues(segments, subtitleText);
+  const srtCues = buildSubtitleCues(segments, subtitleText);
+  const burnCues = buildBurnCues(segments, subtitleText);
 
-  // Subtitle-only: keep the original audio, skip TTS + mixing entirely.
   if (outputMode === "subtitle") {
-    await renderSubtitleOnly(jobId, job.inputKey, cues, burn, burnStyle);
+    await renderSubtitleOnly(jobId, job.inputKey, srtCues, burnCues, burn, style, capTo1080);
     return;
   }
 
   if (!job.voiceName) throw new Error("Job has no voiceName chosen");
 
-  // 1. Group adjacent segments into "speech blocks" for TTS only — the DB
-  //    keeps each Whisper segment as its own editable row, but at synthesis
-  //    time we concatenate adjacent translations (gap ≤ 1.0s, total length
-  //    ≤ 600 chars) into single Gemini calls so the voice stays consistent
-  //    across the whole sentence and short pauses don't sound like a
-  //    different speaker stepping in.
-  //
-  //    Each group's audio is placed at the FIRST member's startSec; the
-  //    members' individual timestamps are discarded for placement (but
-  //    preserved in the DB for the editor and SRT).
   await prisma.job.update({
     where: { id: jobId },
-    data: { status: JobStatus.SYNTHESIZING },
+    data: { status: JobStatus.SYNTHESIZING, progress: 0, progressNote: "Дуу үүсгэж байна" },
   });
 
-  // Each TTS provider has its own per-request length limit:
-  //   • Gemini Flash TTS — empirically truncates past ~600 chars
-  //   • Chimege /synthesize — server hard-caps at 300 chars (error 4002)
-  // Pick maxChars per provider to keep groups under the cap.
+  // Start pulling the source video NOW so it overlaps with TTS instead of
+  // blocking the mux step later. Guard the floating promise so a rejection
+  // can't crash the process before we await it.
+  const videoReady = ensureLocalVideo(jobId).catch((e) => {
+    console.error(`[render] job=${jobId} video fetch error:`, e);
+    return Promise.reject(e);
+  });
+  videoReady.catch(() => void 0);
+
   const ttsProvider = job.ttsProvider ?? "gemini";
   const isChimege = ttsProvider === "chimege";
   const maxChars = isChimege ? 280 : 600;
+  const ttsConcurrency = isChimege ? 6 : 3; // Gemini TTS preview is RPM-bound
 
-  const groups = groupForSynthesis(segments, {
-    maxGapSec: 1.0,
-    maxChars,
-  });
+  const groups = groupForSynthesis(segments, { maxGapSec: 1.0, maxChars });
   console.log(
-    `[render] job=${jobId} provider=${ttsProvider} grouped ${segments.length} segments → ${groups.length} TTS calls`,
+    `[render] job=${jobId} provider=${ttsProvider} grouped ${segments.length} segments → ${groups.length} TTS calls @ conc ${ttsConcurrency}`,
   );
 
-  const concurrency = 2;
-  const segmentClips: { startSec: number; endSec: number; audioPath: string }[] = [];
+  const segmentClips: { startSec: number; endSec: number; audioPath: string }[] = new Array(groups.length);
   const tempPaths: string[] = [];
+  // S3 preview uploads + DB audioKey writes don't gate the render output — run
+  // them off the critical path and await once at the end.
+  const sideEffects: Promise<unknown>[] = [];
+  let completed = 0;
 
   try {
-    for (let i = 0; i < groups.length; i += concurrency) {
-      const batch = groups.slice(i, i + concurrency);
-      const results = await Promise.all(
-        batch.map(async (group) => {
-          const combinedText = group.segments
-            .map((s) => s.translatedText!.trim())
-            .join(" ");
-
-          const wav = isChimege
-            ? await synthesizeChimege({
-                text: combinedText,
-                voiceId: job.voiceName!,
-              })
-            : await synthesizeGemini({
-                text: combinedText,
-                voiceName: job.voiceName!,
-                stylePrompt: job.stylePrompt ?? undefined,
-                temperature: job.temperature ?? undefined,
-              });
-          const localPath = tmpPath("wav");
-          tempPaths.push(localPath);
-          await writeFile(localPath, wav);
-
-          // Persist the group's audio under the first segment's key so the
-          // editor can preview it (sequence-based key remains stable).
-          const firstSeg = group.segments[0];
-          const segKey = `jobs/${jobId}/segments/${firstSeg.sequence}.wav`;
-          await uploadBuffer(wav, segKey, "audio/wav");
-          // Update every member of the group to point at the same key —
-          // playback from any of them retrieves the same combined audio.
-          await prisma.segment.updateMany({
-            where: {
-              jobId,
-              sequence: { in: group.segments.map((s) => s.sequence) },
-            },
-            data: { audioKey: segKey },
+    await mapPool(groups, ttsConcurrency, async (group, i) => {
+      const combinedText = group.segments.map((s) => s.translatedText!.trim()).join(" ");
+      const wav = isChimege
+        ? await synthesizeChimege({ text: combinedText, voiceId: job.voiceName! })
+        : await synthesizeGemini({
+            text: combinedText,
+            voiceName: job.voiceName!,
+            stylePrompt: job.stylePrompt ?? undefined,
+            temperature: job.temperature ?? undefined,
           });
+      const localPath = tmpPath("wav");
+      tempPaths.push(localPath);
+      await writeFile(localPath, wav);
 
-          return {
-            startSec: firstSeg.startSec,
-            endSec: group.segments[group.segments.length - 1].endSec,
-            audioPath: localPath,
-          };
-        }),
+      segmentClips[i] = {
+        startSec: group.segments[0].startSec,
+        endSec: group.segments[group.segments.length - 1].endSec,
+        audioPath: localPath,
+      };
+
+      // Off-critical-path: persist preview audio + audioKey (best-effort).
+      const segKey = `jobs/${jobId}/segments/${group.segments[0].sequence}.wav`;
+      const seqs = group.segments.map((s) => s.sequence);
+      sideEffects.push(
+        uploadBuffer(wav, segKey, "audio/wav")
+          .then(() =>
+            prisma.segment.updateMany({
+              where: { jobId, sequence: { in: seqs } },
+              data: { audioKey: segKey },
+            }),
+          )
+          .catch((e) => console.warn(`[render] preview persist failed seq=${seqs[0]}:`, e)),
       );
-      segmentClips.push(...results);
-    }
 
-    // 2. Pull source video to read its duration and remix.
-    await prisma.job.update({
-      where: { id: jobId },
-      data: { status: JobStatus.MUXING },
+      completed++;
+      await prisma.job
+        .update({
+          where: { id: jobId },
+          data: {
+            progress: Math.round((completed / groups.length) * 100),
+            progressNote: `Дуу үүсгэж байна ${completed}/${groups.length}`,
+          },
+        })
+        .catch(() => void 0);
     });
 
-    const videoPath = tmpPath("mp4");
+    // 2. Mix + mux.
+    await prisma.job.update({
+      where: { id: jobId },
+      data: { status: JobStatus.MUXING, progressNote: "Видеотой нэгтгэж байна" },
+    });
+
+    const videoPath = await videoReady;
+    const meta = await probeVideoMeta(videoPath);
+
     const mixedPath = tmpPath("wav");
     const dubbedPath = tmpPath("mp4");
     const srtPath = tmpPath("srt");
-    const originalAudioPath = tmpPath("wav");
-    tempPaths.push(videoPath, mixedPath, dubbedPath, srtPath, originalAudioPath);
+    tempPaths.push(mixedPath, dubbedPath, srtPath);
 
-    await downloadToFile(job.inputKey, videoPath);
-    const duration = await probeDuration(videoPath);
-
-    // Re-extract original audio for ducking. We could pull job.audioKey from
-    // object storage instead, but extracting again is faster than a network
-    // round-trip and guarantees the file is present on this run.
-    await extractAudio(videoPath, originalAudioPath);
-
-    await mixSegmentsToTimeline(segmentClips, duration, mixedPath, {
-      originalAudioPath,
-      // Original plays at FULL volume between segments (music, atmosphere come through).
-      // While a Mongolian segment is speaking, original ducks to 5% (-26 dB) —
-      // deep enough that Chinese voice doesn't bleed through under the dub.
+    await mixSegmentsToTimeline(segmentClips, meta.durationSec, mixedPath, {
+      originalAudioPath: videoPath, // read original audio straight from the video
       duckLevel: 0.05,
     });
-    await replaceAudioTrack(videoPath, mixedPath, dubbedPath);
 
-    // SRT subtitle (always produced as a downloadable artifact).
-    await writeSrt(cues, srtPath);
+    await writeSrt(srtCues, srtPath);
 
-    // Optionally hardsub the subtitles onto the dubbed video.
-    let finalVideoPath = dubbedPath;
+    let finalVideoPath: string;
     if (burn) {
+      // Single pass: mux the dub AND burn subs in one ffmpeg invocation
+      // (the old code wrote a full intermediate mp4, then re-read + re-encoded
+      // it — a redundant whole-video write/read + a second AAC generation).
+      const { outW, outH, scaleToHeight } = outputDims(meta, capTo1080);
+      const assPath = tmpPath("ass");
       const burnedPath = tmpPath("mp4");
-      tempPaths.push(burnedPath);
-      await burnSubtitles(dubbedPath, srtPath, burnedPath, burnStyle);
+      tempPaths.push(assPath, burnedPath);
+      await writeAss(burnCues, style, outW, outH, assPath);
+      await burnAss(videoPath, assPath, burnedPath, { audioPath: mixedPath, scaleToHeight, outHeight: outH });
       finalVideoPath = burnedPath;
+    } else {
+      finalVideoPath = dubbedPath;
+      await replaceAudioTrack(videoPath, mixedPath, dubbedPath);
     }
 
-    // 3. Upload outputs.
     const outputKey = `jobs/${jobId}/output.mp4`;
     const subtitleKey = `jobs/${jobId}/output.srt`;
     await uploadFile(finalVideoPath, outputKey, "video/mp4");
     await uploadFile(srtPath, subtitleKey, "application/x-subrip");
 
+    await Promise.allSettled(sideEffects);
+
     await prisma.job.update({
       where: { id: jobId },
-      data: {
-        status: JobStatus.DONE,
-        outputKey,
-        subtitleKey,
-      },
+      data: { status: JobStatus.DONE, outputKey, subtitleKey, progress: 100, progressNote: null },
     });
+    await cleanupJobCache(jobId);
   } finally {
     for (const p of tempPaths) safeUnlink(p);
   }
 }
 
-type SubtitleText = "translated" | "source" | "both";
+/** Compute output (possibly downscaled) dimensions for the burn pass. */
+function outputDims(
+  meta: { width: number; height: number },
+  capTo1080: boolean,
+): { outW: number; outH: number; scaleToHeight?: number } {
+  if (capTo1080 && meta.height > SUBTITLE_REF_HEIGHT) {
+    const outH = SUBTITLE_REF_HEIGHT;
+    const outW = Math.round((meta.width * outH) / meta.height / 2) * 2; // even
+    return { outW, outH, scaleToHeight: outH };
+  }
+  return { outW: meta.width, outH: meta.height };
+}
 
 interface SubtitleCue {
   startSec: number;
@@ -496,76 +634,87 @@ interface SubtitleCue {
   text: string;
 }
 
-/**
- * Turn segments into subtitle cues for the chosen text mode:
- *   • "translated" — Mongolian only
- *   • "source"     — original (e.g. Chinese) only
- *   • "both"       — source on top, translation below (dual-line cue)
- * Empty cues are dropped so blank lines don't flash on screen.
- */
+/** Flat cues (for the SRT artifact). */
 function buildSubtitleCues(
-  segments: {
-    startSec: number;
-    endSec: number;
-    sourceText: string;
-    translatedText: string | null;
-  }[],
+  segments: { startSec: number; endSec: number; sourceText: string; translatedText: string | null }[],
   mode: SubtitleText,
 ): SubtitleCue[] {
   return segments
     .map((s) => {
       let text: string;
-      if (mode === "source") {
-        text = s.sourceText.trim();
-      } else if (mode === "both") {
-        text = `${s.sourceText.trim()}\n${(s.translatedText ?? "").trim()}`.trim();
-      } else {
-        text = (s.translatedText ?? "").trim();
-      }
+      if (mode === "source") text = s.sourceText.trim();
+      else if (mode === "both") text = `${s.sourceText.trim()}\n${(s.translatedText ?? "").trim()}`.trim();
+      else text = (s.translatedText ?? "").trim();
       return { startSec: s.startSec, endSec: s.endSec, text };
     })
     .filter((c) => c.text.length > 0);
 }
 
+/** Structured cues (for the .ass burn — keeps zh/mn separate for per-line styling). */
+function buildBurnCues(
+  segments: { startSec: number; endSec: number; sourceText: string; translatedText: string | null }[],
+  mode: SubtitleText,
+): BurnCue[] {
+  const out: BurnCue[] = [];
+  for (const s of segments) {
+    const zh = s.sourceText.trim();
+    const mn = (s.translatedText ?? "").trim();
+    let cue: BurnCue | null = null;
+    if (mode === "source") cue = zh ? { startSec: s.startSec, endSec: s.endSec, zh } : null;
+    else if (mode === "both") {
+      if (zh || mn) cue = { startSec: s.startSec, endSec: s.endSec, zh: zh || undefined, mn: mn || undefined };
+    } else cue = mn ? { startSec: s.startSec, endSec: s.endSec, mn } : null;
+    if (cue) out.push(cue);
+  }
+  return out;
+}
+
 /**
- * Subtitle-only render: no TTS. Write the SRT, and — if `burn` — hardsub it
- * onto the source video. When not burning, the original upload IS the output
- * (we just attach the SRT), so we skip a needless re-encode.
+ * Subtitle-only render: no TTS. Write the SRT artifact, and — if `burn` —
+ * hardsub a generated .ass onto the source video in one pass (keeping the
+ * original audio). When not burning, the original upload IS the output.
  */
 async function renderSubtitleOnly(
   jobId: string,
-  inputKey: string,
-  cues: SubtitleCue[],
+  inputKey: string | null,
+  srtCues: SubtitleCue[],
+  burnCues: BurnCue[],
   burn: boolean,
-  burnStyle: BurnSubtitleStyle,
+  style: BurnSubtitleStyle,
+  capTo1080: boolean,
 ): Promise<void> {
   await prisma.job.update({
     where: { id: jobId },
-    data: { status: JobStatus.MUXING },
+    data: { status: JobStatus.MUXING, progressNote: burn ? "Хадмал шатааж байна" : "Хадмал бэлдэж байна" },
   });
 
   const srtPath = tmpPath("srt");
   const tempPaths: string[] = [srtPath];
   try {
-    await writeSrt(cues, srtPath);
+    await writeSrt(srtCues, srtPath);
     const subtitleKey = `jobs/${jobId}/output.srt`;
     await uploadFile(srtPath, subtitleKey, "application/x-subrip");
 
     let outputKey = inputKey; // no burn → original video is the output
     if (burn) {
-      const videoPath = tmpPath("mp4");
+      if (!inputKey) throw new Error("Хадмал шатаах видео алга");
+      const videoPath = await ensureLocalVideo(jobId);
+      const meta = await probeVideoMeta(videoPath);
+      const { outW, outH, scaleToHeight } = outputDims(meta, capTo1080);
+      const assPath = tmpPath("ass");
       const outputPath = tmpPath("mp4");
-      tempPaths.push(videoPath, outputPath);
-      await downloadToFile(inputKey, videoPath);
-      await burnSubtitles(videoPath, srtPath, outputPath, burnStyle);
+      tempPaths.push(assPath, outputPath);
+      await writeAss(burnCues, style, outW, outH, assPath);
+      await burnAss(videoPath, assPath, outputPath, { scaleToHeight, outHeight: outH });
       outputKey = `jobs/${jobId}/output.mp4`;
       await uploadFile(outputPath, outputKey, "video/mp4");
     }
 
     await prisma.job.update({
       where: { id: jobId },
-      data: { status: JobStatus.DONE, outputKey, subtitleKey },
+      data: { status: JobStatus.DONE, outputKey, subtitleKey, progress: 100, progressNote: null },
     });
+    await cleanupJobCache(jobId);
   } finally {
     for (const p of tempPaths) safeUnlink(p);
   }
@@ -585,6 +734,7 @@ export async function safeRun(
       where: { id: jobId },
       data: { status: JobStatus.FAILED, errorMessage: msg },
     });
+    await cleanupJobCache(jobId);
   }
 }
 
@@ -592,7 +742,7 @@ function safeUnlink(path: string): void {
   try {
     unlinkSync(path);
   } catch {
-    // ignore — file may not exist if step failed early
+    /* ignore — file may not exist if step failed early */
   }
 }
 
@@ -607,22 +757,9 @@ interface SynthesisGroup {
 }
 
 /**
- * Group adjacent Segment rows into batches for one Gemini TTS call.
- *
- * Why group at all?
- *   • Per-segment TTS calls have independent tone variation that listeners
- *     hear as "different speakers stuttering" inside one sentence.
- *   • Sending the full sentence as one call lets Gemini voice it with a
- *     single coherent prosody.
- *
- * Why a `maxChars` ceiling?
- *   • Gemini Flash TTS truncates long outputs — past roughly 600-800 chars
- *     of input we start losing the tail of the audio. Capping prevents that.
- *
- * Why a `maxGapSec` ceiling?
- *   • A long silence in the original (>1s) usually marks either a speaker
- *     change or a beat that the dub should also pause for. We keep those
- *     as separate groups to preserve rhythm.
+ * Group adjacent Segment rows into batches for one TTS call so each sentence is
+ * voiced with a single coherent prosody. `maxGapSec` keeps real pauses as
+ * separate groups; `maxChars` keeps each call under the provider's limit.
  */
 function groupForSynthesis(
   segments: {
@@ -652,44 +789,7 @@ function groupForSynthesis(
       currentChars = 0;
     }
     current.segments.push(seg);
-    currentChars += txt.length + 1; // +1 for join space
-  }
-  return out;
-}
-
-/**
- * Group consecutive STT segments separated by short pauses into single
- * continuous "speech blocks". Whisper exposes per-comma micro-segments
- * (e.g. "我来 / 说今天 / 神舟22号 / 飞船 …") which would each go to TTS as a
- * separate call — and each call has tiny independent tone variation that
- * adds up to sounding like multiple speakers stuttering through a sentence.
- *
- * By concatenating them into one bigger block before TTS, Gemini gets the
- * full thought as a single utterance and voices it with one consistent prosody.
- *
- * `maxGapSec` is the longest silence we consider "still the same sentence".
- * Bigger values yield fewer, longer blocks but risk merging across speaker
- * turns. 1.0s works well for typical news / dialogue content.
- */
-function mergeContinuousBlocks(
-  segs: { start: number; end: number; text: string }[],
-  maxGapSec: number,
-): { start: number; end: number; text: string }[] {
-  if (segs.length === 0) return [];
-  const out: { start: number; end: number; text: string }[] = [
-    { ...segs[0], text: segs[0].text.trim() },
-  ];
-  for (let i = 1; i < segs.length; i++) {
-    const last = out[out.length - 1];
-    const cur = segs[i];
-    if (cur.start - last.end <= maxGapSec) {
-      // Continuous — extend the current block.
-      last.end = cur.end;
-      last.text = `${last.text} ${cur.text.trim()}`.trim();
-    } else {
-      // Real silence between → new block.
-      out.push({ ...cur, text: cur.text.trim() });
-    }
+    currentChars += txt.length + 1;
   }
   return out;
 }

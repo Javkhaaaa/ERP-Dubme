@@ -3,31 +3,48 @@ import { config } from "../config.js";
 
 const genai = new GoogleGenAI({ apiKey: config.geminiApiKey });
 
-// Gemini 2.5 Pro — quality-first model. We keep it even though we disable
-// `thinking` below: Pro's base output is still meaningfully better than
-// Flash on low-resource targets like Mongolian (number-as-word compliance,
-// idiom adaptation, less hallucinated transliteration), and switching off
-// thinking trims ~3× off the per-call latency at minimal quality cost.
+// Gemini 2.5 Pro — quality-first model. Mongolian is low-resource, and Pro's
+// base output is meaningfully better than Flash (number-as-word compliance,
+// idiom adaptation, less hallucinated transliteration). We disable most
+// `thinking` to trim latency at minimal quality cost.
 const TRANSLATE_MODEL = "gemini-2.5-pro";
+// A fast model is plenty for the cheap glossary-extraction pass.
+const GLOSSARY_MODEL = "gemini-2.5-flash";
 
-// Long videos can produce 1000+ segments. Sending them all in one prompt
-// degrades quality (model "forgets" earlier constraints) and risks output
-// truncation. We batch into manageable groups and pass a sliding window of
-// the previous batch's source+translation as carry-over context so
-// terminology and tone stay consistent across batch boundaries.
 const BATCH_SIZE = 80;
 const CONTEXT_LINES = 6;
-// Concurrent batches per "wave". Each wave runs in parallel, then we wait
-// for the wave to finish before starting the next — so wave-N batches still
-// get sliding context from the end of wave-(N-1)'s translations. Trade-off:
-// within a wave, batches don't see each other's terminology choices, but the
-// refine step can paper over any drift and the 4× speedup is worth it.
-const PARALLEL_BATCHES = 4;
+// Batches now run fully in parallel (no inter-wave barrier). Terminology
+// consistency comes from a shared glossary computed up front instead of from a
+// sliding window of the previous wave's translations — so a 2-hour video no
+// longer pays a 5× serialization cost for 6 carry-over lines, AND every batch
+// gets the same glossary (the old scheme left most batches with no context at
+// all). Cap concurrency to stay comfortably under Tier-1 RPM.
+const TRANSLATE_CONCURRENCY = 8;
+
+/** Run tasks with bounded concurrency, preserving order. */
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = new Array(Math.max(1, Math.min(concurrency, items.length)))
+    .fill(0)
+    .map(async () => {
+      while (true) {
+        const i = next++;
+        if (i >= items.length) break;
+        results[i] = await fn(items[i], i);
+      }
+    });
+  await Promise.all(workers);
+  return results;
+}
 
 /**
- * Translate every segment text to the target language. Internally batches
- * long inputs and prepends prior-batch context so a 2-hour video doesn't
- * lose tone halfway through.
+ * Translate every segment text to the target language. Builds a shared
+ * glossary first, then translates all batches in parallel.
  */
 export async function translateSegments(
   texts: string[],
@@ -36,75 +53,133 @@ export async function translateSegments(
 ): Promise<string[]> {
   if (texts.length === 0) return [];
 
-  const results: string[] = new Array(texts.length).fill("");
+  const glossary = await buildGlossary(texts, sourceLanguage, targetLanguage).catch(
+    (e) => {
+      console.warn(`[translate] glossary step failed (continuing without): ${e}`);
+      return "";
+    },
+  );
 
-  // Collect every batch's starting index up front so we can group them
-  // into parallel waves.
   const batchStarts: number[] = [];
   for (let s = 0; s < texts.length; s += BATCH_SIZE) batchStarts.push(s);
-  const totalBatches = batchStarts.length;
 
-  for (
-    let waveIdx = 0;
-    waveIdx < totalBatches;
-    waveIdx += PARALLEL_BATCHES
-  ) {
-    const wave = batchStarts.slice(waveIdx, waveIdx + PARALLEL_BATCHES);
-    const waveOutputs = await Promise.all(
-      wave.map((start) => {
-        const end = Math.min(start + BATCH_SIZE, texts.length);
-        const batchTexts = texts.slice(start, end);
-        // Context only flows from PRIOR waves' results — batches within the
-        // same wave can't see each other (they're inflight in parallel).
-        const ctxFrom = Math.max(0, start - CONTEXT_LINES);
-        const ctxSources = texts.slice(ctxFrom, start);
-        const ctxTranslations = results.slice(ctxFrom, start);
-        return translateBatch(
-          batchTexts,
-          ctxSources,
-          ctxTranslations,
-          sourceLanguage,
-          targetLanguage,
-          texts.length,
-          start,
-        );
-      }),
+  const results: string[] = new Array(texts.length).fill("");
+  let doneBatches = 0;
+  await mapPool(batchStarts, TRANSLATE_CONCURRENCY, async (start) => {
+    const end = Math.min(start + BATCH_SIZE, texts.length);
+    const out = await translateBatch(
+      texts.slice(start, end),
+      glossary,
+      sourceLanguage,
+      targetLanguage,
+      texts.length,
+      start,
     );
-    // Splice the wave's outputs back into the results array.
-    wave.forEach((start, i) => {
-      const out = waveOutputs[i];
-      for (let j = 0; j < out.length; j++) {
-        results[start + j] = out[j];
-      }
-    });
-    const waveEnd = Math.min(waveIdx + PARALLEL_BATCHES, totalBatches);
-    console.log(
-      `[translate] wave ${Math.floor(waveIdx / PARALLEL_BATCHES) + 1} done — ` +
-        `${waveEnd}/${totalBatches} batches complete`,
-    );
-  }
+    for (let j = 0; j < out.length; j++) results[start + j] = out[j];
+    doneBatches++;
+    console.log(`[translate] batch ${doneBatches}/${batchStarts.length} done`);
+  });
+
+  // Gemini occasionally drops a numbered line (or truncates a batch), leaving
+  // a blank translation. A blank breaks render ("Translation incomplete: N
+  // lines missing") and shows as an empty subtitle — so re-translate just the
+  // gaps before returning.
+  await fillMissingTranslations(results, texts, glossary, sourceLanguage, targetLanguage);
 
   return results;
 }
 
+/**
+ * Detect lines that came back blank (model dropped/truncated them) and
+ * re-translate ONLY those, up to two passes. Guarantees no non-empty source
+ * line is left without a translation under normal conditions.
+ */
+async function fillMissingTranslations(
+  results: string[],
+  texts: string[],
+  glossary: string,
+  sourceLanguage: string,
+  targetLanguage: string,
+): Promise<void> {
+  const isMissing = (i: number) =>
+    !!texts[i] && texts[i].trim().length > 0 && (!results[i] || !results[i].trim());
+
+  for (let pass = 0; pass < 2; pass++) {
+    const missing: number[] = [];
+    for (let i = 0; i < texts.length; i++) if (isMissing(i)) missing.push(i);
+    if (missing.length === 0) return;
+    console.warn(
+      `[translate] gap-fill pass ${pass + 1}: re-translating ${missing.length} missing line(s)`,
+    );
+    const chunks: number[][] = [];
+    for (let s = 0; s < missing.length; s += BATCH_SIZE) chunks.push(missing.slice(s, s + BATCH_SIZE));
+    await mapPool(chunks, TRANSLATE_CONCURRENCY, async (idxs) => {
+      const out = await translateBatch(
+        idxs.map((i) => texts[i]),
+        glossary,
+        sourceLanguage,
+        targetLanguage,
+        idxs.length,
+        0,
+      ).catch(() => [] as string[]);
+      idxs.forEach((origIdx, j) => {
+        if (out[j] && out[j].trim()) results[origIdx] = out[j];
+      });
+    });
+  }
+
+  const stillMissing = texts.filter((_, i) => isMissing(i)).length;
+  if (stillMissing > 0) {
+    console.warn(`[translate] gap-fill exhausted; ${stillMissing} line(s) still blank`);
+  }
+}
+
+/**
+ * One cheap pass that extracts a zh→mn glossary of recurring proper nouns,
+ * names, places and technical terms, so every parallel batch renders them
+ * consistently. Best-effort: returns "" on any failure.
+ */
+async function buildGlossary(
+  texts: string[],
+  sourceLanguage: string,
+  targetLanguage: string,
+): Promise<string> {
+  if (texts.length < BATCH_SIZE) return ""; // short videos don't need it
+  // Cap the sample so the call stays fast even on multi-hour videos.
+  const joined = texts.join("\n");
+  const sample = joined.length > 12_000 ? joined.slice(0, 12_000) : joined;
+  const prompt = `From the following ${sourceLanguage} subtitle text, extract recurring PROPER NOUNS (people, places, organizations) and TECHNICAL TERMS that need a consistent ${targetLanguage} rendering across a long video.
+
+Output ONLY lines of the form "<source term> = <${targetLanguage} rendering>", at most 40 lines, no commentary. For Mongolian (mn): Cyrillic only; spell numbers/abbreviations as words. If there are no such terms, output nothing.
+
+TEXT:
+${sample}`;
+  const text = await callWithRetry(prompt, {
+    model: GLOSSARY_MODEL,
+    temperature: 0.2,
+    thinkingBudget: 0,
+  });
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.includes("=") && l.length < 200)
+    .slice(0, 40);
+  if (lines.length === 0) return "";
+  console.log(`[translate] glossary: ${lines.length} terms`);
+  return lines.join("\n");
+}
+
 async function translateBatch(
   batchTexts: string[],
-  ctxSources: string[],
-  ctxTranslations: string[],
+  glossary: string,
   sourceLanguage: string,
   targetLanguage: string,
   total: number,
   batchStart: number,
 ): Promise<string[]> {
-  const contextBlock =
-    ctxSources.length > 0
-      ? `\nPRIOR LINES (already translated — for terminology & tone consistency, do NOT re-translate these):\n${ctxSources
-          .map(
-            (s, i) =>
-              `  C${i + 1}. ${sourceLanguage}: ${s}\n      ${targetLanguage}: ${ctxTranslations[i]}`,
-          )
-          .join("\n")}\n`
-      : "";
+  const glossaryBlock = glossary
+    ? `\nGLOSSARY (use these exact ${targetLanguage} renderings for consistency across the whole video):\n${glossary}\n`
+    : "";
 
   const numbered = batchTexts.map((t, i) => `${i + 1}. ${t}`).join("\n");
   const isMultiBatch = total > BATCH_SIZE;
@@ -113,13 +188,13 @@ async function translateBatch(
     : "";
 
   const prompt = `You are a professional ${targetLanguage} subtitle translator for video dubbing. ${batchLabel}Translate the ${batchTexts.length} numbered lines below from ${sourceLanguage} to ${targetLanguage}.
-${contextBlock}
+${glossaryBlock}
 TRANSLATION QUALITY BAR:
 - The result must read as if a native ${targetLanguage} speaker wrote it from scratch — NOT a literal word-for-word translation.
 - Adapt Chinese idioms, four-character expressions, and grammatical structures to natural ${targetLanguage}. A literal rendering that sounds foreign is WRONG even if it preserves every word.
 - The viewer should understand the meaning instantly when the voiceover plays.
-- Keep tone consistent with prior lines (formal news / casual / dramatic / etc).
-- Recurring proper nouns, place names, and technical terms MUST match across batches — see PRIOR LINES above.
+- Keep tone consistent (formal news / casual / dramatic / etc).
+- Recurring proper nouns, place names, and technical terms MUST match the GLOSSARY above.
 
 HARD RULES:
 - Preserve the line numbering exactly. One ${targetLanguage} line per source line — do NOT merge or split.
@@ -143,13 +218,8 @@ Output:`;
 
 /**
  * Re-translate the given target lines applying a user-supplied style
- * instruction. Original source lines are passed alongside so the model has
- * the same context that produced the first pass and can pick better wording
- * without drifting from the source meaning.
- *
- * Used by the editor's "AI-аар орчуулга сайжруулах" flow: the user picks (or
- * writes) a style — "ярианы аястай", "албан ёсны", "хүүхдэд зориулсан", … —
- * and we rewrite every segment in one batch call so tone stays consistent.
+ * instruction. Runs all batches in parallel with a shared glossary, same as
+ * the first-pass translator.
  */
 export async function refineSegments(
   sourceTexts: string[],
@@ -165,51 +235,36 @@ export async function refineSegments(
     );
   }
 
-  const results: string[] = new Array(sourceTexts.length).fill("");
+  const glossary = await buildGlossary(sourceTexts, sourceLanguage, targetLanguage).catch(
+    () => "",
+  );
 
   const batchStarts: number[] = [];
   for (let s = 0; s < sourceTexts.length; s += BATCH_SIZE) batchStarts.push(s);
-  const totalBatches = batchStarts.length;
 
-  for (
-    let waveIdx = 0;
-    waveIdx < totalBatches;
-    waveIdx += PARALLEL_BATCHES
-  ) {
-    const wave = batchStarts.slice(waveIdx, waveIdx + PARALLEL_BATCHES);
-    const waveOutputs = await Promise.all(
-      wave.map((start) => {
-        const end = Math.min(start + BATCH_SIZE, sourceTexts.length);
-        const batchSources = sourceTexts.slice(start, end);
-        const batchCurrents = currentTranslations.slice(start, end);
-        // Carry over from the prior wave's already-refined lines.
-        const ctxFrom = Math.max(0, start - CONTEXT_LINES);
-        const ctxSources = sourceTexts.slice(ctxFrom, start);
-        const ctxRefined = results.slice(ctxFrom, start);
-        return refineBatch(
-          batchSources,
-          batchCurrents,
-          ctxSources,
-          ctxRefined,
-          sourceLanguage,
-          targetLanguage,
-          styleInstruction,
-          sourceTexts.length,
-          start,
-        );
-      }),
+  const results: string[] = new Array(sourceTexts.length).fill("");
+  let done = 0;
+  await mapPool(batchStarts, TRANSLATE_CONCURRENCY, async (start) => {
+    const end = Math.min(start + BATCH_SIZE, sourceTexts.length);
+    const out = await refineBatch(
+      sourceTexts.slice(start, end),
+      currentTranslations.slice(start, end),
+      glossary,
+      sourceLanguage,
+      targetLanguage,
+      styleInstruction,
+      sourceTexts.length,
+      start,
     );
-    wave.forEach((start, i) => {
-      const out = waveOutputs[i];
-      for (let j = 0; j < out.length; j++) {
-        results[start + j] = out[j];
-      }
-    });
-    const waveEnd = Math.min(waveIdx + PARALLEL_BATCHES, totalBatches);
-    console.log(
-      `[refine] wave ${Math.floor(waveIdx / PARALLEL_BATCHES) + 1} done — ` +
-        `${waveEnd}/${totalBatches} batches complete`,
-    );
+    for (let j = 0; j < out.length; j++) results[start + j] = out[j];
+    done++;
+    console.log(`[refine] batch ${done}/${batchStarts.length} done`);
+  });
+
+  // Never blank a line during refine — if the model dropped one, keep the
+  // existing translation rather than overwriting it with "".
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i] || !results[i].trim()) results[i] = currentTranslations[i] ?? "";
   }
 
   return results;
@@ -218,23 +273,16 @@ export async function refineSegments(
 async function refineBatch(
   batchSources: string[],
   batchCurrents: string[],
-  ctxSources: string[],
-  ctxRefined: string[],
+  glossary: string,
   sourceLanguage: string,
   targetLanguage: string,
   styleInstruction: string,
   total: number,
   batchStart: number,
 ): Promise<string[]> {
-  const contextBlock =
-    ctxSources.length > 0
-      ? `\nPRIOR LINES (already refined in this style — for terminology & tone consistency, do NOT re-refine these):\n${ctxSources
-          .map(
-            (s, i) =>
-              `  C${i + 1}. SOURCE: ${s}\n      REFINED: ${ctxRefined[i]}`,
-          )
-          .join("\n")}\n`
-      : "";
+  const glossaryBlock = glossary
+    ? `\nGLOSSARY (keep these ${targetLanguage} renderings consistent):\n${glossary}\n`
+    : "";
 
   const numbered = batchSources
     .map(
@@ -252,13 +300,13 @@ async function refineBatch(
 
 CONTENT TYPE / STYLE (from the user):
 ${styleInstruction}
-${contextBlock}
+${glossaryBlock}
 WHAT "GOOD" LOOKS LIKE:
 - Reads naturally when spoken aloud (this is for dubbing — the voice actor must sound like a real ${targetLanguage} speaker, not a translator).
 - Idioms and phrasings adapted to ${targetLanguage} — do NOT translate word-for-word if the literal version sounds awkward.
 - Vocabulary, register, and tone match the CONTENT TYPE above (a horror line should feel tense; a comedy line should feel playful; news should sound objective and structured; etc.).
 - The viewer should understand the meaning instantly — no convoluted grammar, no foreign sentence shape.
-- Recurring proper nouns, place names, and technical terms MUST match the PRIOR LINES above so the refined batches stay consistent.
+- Recurring proper nouns, place names, and technical terms MUST match the GLOSSARY above.
 
 HARD RULES:
 - Preserve the line numbering exactly.
@@ -282,50 +330,39 @@ Output:`;
   return parseNumberedLines(responseText, batchSources.length);
 }
 
+interface CallOptions {
+  model?: string;
+  temperature?: number;
+  thinkingBudget?: number;
+}
+
 /**
- * Wrap the Gemini Pro generateContent call with retry. Transient network
- * blips (DNS, TLS handshake, idle-connection RST) surface as plain "fetch
- * failed" — those should not fail the entire job. 5xx and 429 from Gemini
- * itself are also retriable.
+ * Wrap the Gemini generateContent call with retry + jitter. Transient network
+ * blips and 5xx/429 are retried; everything else fails fast.
  */
-async function callWithRetry(prompt: string): Promise<string> {
+async function callWithRetry(prompt: string, opts: CallOptions = {}): Promise<string> {
+  const model = opts.model ?? TRANSLATE_MODEL;
+  const temperature = opts.temperature ?? 0.4;
+  // Pro REQUIRES thinking (min 128); Flash accepts 0 to disable it.
+  const thinkingBudget = opts.thinkingBudget ?? 128;
   const maxAttempts = 4;
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const startedAt = Date.now();
     try {
       const result = await genai.models.generateContent({
-        model: TRANSLATE_MODEL,
+        model,
         contents: prompt,
-        config: {
-          // Low-but-not-zero — translation is largely deterministic, but a
-          // little stochasticity lets Pro pick more natural phrasings over
-          // its most-probable (often literal) first guess.
-          temperature: 0.4,
-          // Minimum thinking — Gemini 2.5 Pro REQUIRES thinking mode (the
-          // API rejects `thinkingBudget: 0` with INVALID_ARGUMENT on Pro).
-          // 128 is the smallest allowed value; it gives the model just
-          // enough headroom to apply the strict number-as-word / idiom
-          // rules without burning the ~3000 deliberation tokens dynamic
-          // mode would normally use. Combined with parallel waves below
-          // this brings a 2hr video from ~10min to ~1.5min total.
-          thinkingConfig: { thinkingBudget: 128 },
-        },
+        config: { temperature, thinkingConfig: { thinkingBudget } },
       });
-      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-      console.log(`[translate] gemini call ok in ${elapsed}s`);
       return result.text ?? "";
     } catch (err) {
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
       const transient =
-        /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up|429|5\d\d/i.test(
-          msg,
-        );
-      if (!transient || attempt === maxAttempts) {
-        throw err;
-      }
-      const waitMs = Math.min(2_000 * 2 ** (attempt - 1), 20_000);
+        /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up|429|5\d\d/i.test(msg);
+      if (!transient || attempt === maxAttempts) throw err;
+      const base = Math.min(2_000 * 2 ** (attempt - 1), 20_000);
+      const waitMs = Math.round(base * (0.5 + Math.random() * 0.5)); // full jitter
       console.warn(
         `[translate] attempt ${attempt}/${maxAttempts} failed: ${msg}. Retrying in ${waitMs}ms`,
       );
@@ -337,7 +374,7 @@ async function callWithRetry(prompt: string): Promise<string> {
 
 /**
  * Parse Gemini's "1. ...\n2. ..." output back into an array.
- * Tolerates extra whitespace, "1)" / "1." styles, and missing lines (filled with "").
+ * Tolerates extra whitespace, "1)" / "1." styles, and missing lines.
  */
 function parseNumberedLines(text: string, expectedCount: number): string[] {
   const lines = text
@@ -353,7 +390,6 @@ function parseNumberedLines(text: string, expectedCount: number): string[] {
       out[idx] = match[2].trim();
     }
   }
-  // If the model didn't follow numbering, fall back to line-by-line.
   if (out.every((s) => s === "") && lines.length === expectedCount) {
     return lines;
   }

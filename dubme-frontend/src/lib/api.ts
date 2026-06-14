@@ -19,6 +19,10 @@ export type JobStatus =
 export type OutputMode = "dub" | "subtitle";
 export type SubtitleText = "translated" | "source" | "both";
 export type SubtitlePosition = "top" | "middle" | "bottom";
+export type SubtitleAlign = "left" | "center" | "right";
+
+/** Reference height all subtitle px values are expressed in (matches backend). */
+export const SUBTITLE_REF_HEIGHT = 1080;
 
 export interface Job {
   id: string;
@@ -29,15 +33,35 @@ export interface Job {
   outputMode: OutputMode;
   subtitleText: SubtitleText;
   subtitleBurn: boolean;
+  capTo1080: boolean;
+  // Subtitle style (sizes are px @ 1080p reference)
+  subtitleFontFamily: string;
   subtitleFontSize: number;
+  subtitleBold: boolean;
+  subtitleItalic: boolean;
   subtitleTextColor: string;
+  subtitleOutlineWidth: number;
+  subtitleOutlineColor: string;
+  subtitleOutlineAlpha: number;
+  subtitleShadowDepth: number;
+  subtitleShadowColor: string;
   subtitleBgColor: string | null;
+  subtitleBgOpacity: number;
+  subtitleAlign: SubtitleAlign;
+  subtitleMarginHPct: number;
+  subtitleLetterSpacing: number;
   subtitlePosition: SubtitlePosition;
   subtitlePositionPct: number;
+  subtitleZhScale: number;
+  subtitleZhColor: string | null;
   inputKey: string | null;
   outputKey: string | null;
   subtitleKey: string | null;
   errorMessage: string | null;
+  progress: number | null;
+  progressNote: string | null;
+  refining: boolean;
+  refineError: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -206,12 +230,14 @@ export async function updateSegment(
 
 /**
  * Ask the backend to rewrite every translation in this job according to a
- * user-supplied style instruction. Returns the full refreshed segment list.
+ * user-supplied style instruction. Runs in the BACKGROUND — returns
+ * immediately (202); poll the job until `refining` clears, then refetch
+ * segments. (No longer returns the segment list synchronously.)
  */
 export async function refineTranslations(
   jobId: string,
   prompt: string,
-): Promise<Segment[]> {
+): Promise<{ ok: boolean; refining: boolean }> {
   return api(`/api/jobs/${jobId}/refine`, {
     method: "POST",
     body: JSON.stringify({ prompt }),
@@ -225,13 +251,29 @@ export interface RenderOptions {
   subtitleText: SubtitleText;
   /** Burn the subtitle onto the video (hardsub) in addition to the SRT file. */
   subtitleBurn: boolean;
-  /** Font size, text/background colour, and position. Only applied when burning. */
+  /** Downscale output to 1080p before burning (big speed win on 4K). */
+  capTo1080?: boolean;
+  // Subtitle style (sizes/widths are px @ 1080p reference). Applied when burning.
+  subtitleFontFamily?: string;
   subtitleFontSize?: number;
+  subtitleBold?: boolean;
+  subtitleItalic?: boolean;
   subtitleTextColor?: string;
+  subtitleOutlineWidth?: number;
+  subtitleOutlineColor?: string;
+  subtitleOutlineAlpha?: number;
+  subtitleShadowDepth?: number;
+  subtitleShadowColor?: string;
   subtitleBgColor?: string | null;
+  subtitleBgOpacity?: number;
+  subtitleAlign?: SubtitleAlign;
+  subtitleMarginHPct?: number;
+  subtitleLetterSpacing?: number;
   subtitlePosition?: SubtitlePosition;
-  /** 0-100, vertical position as % from top of frame. Default 88. */
+  /** 0-100, vertical position as % from top (bottom edge of text block). */
   subtitlePositionPct?: number;
+  subtitleZhScale?: number;
+  subtitleZhColor?: string | null;
   /** Required only when outputMode === "dub". */
   voiceName?: string;
   ttsProvider?: "gemini" | "chimege";

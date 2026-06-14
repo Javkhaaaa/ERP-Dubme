@@ -29,14 +29,34 @@ model Job {
   /// Which text the subtitle shows: "translated" (mn), "source" (zh), or
   /// "both" (source on top, translation below).
   subtitleText    String    @default("translated")
-  /// Subtitle styling (applied when subtitleBurn=true).
-  subtitleFontSize  Int     @default(22)
-  subtitleTextColor String  @default("#FFFFFF")  // hex #RRGGBB
-  subtitleBgColor   String?                       // hex #RRGGBB, null = no background
-  subtitlePosition  String  @default("bottom")   // legacy: "top" | "middle" | "bottom" — kept for backwards compat, no longer read
-  /// 0 = top of frame, 100 = bottom. Default 88 places the subtitle in the
-  /// standard lower-third area. Replaces subtitlePosition.
+  /// Subtitle styling (applied when subtitleBurn=true). All sizes/widths are
+  /// px at a 1080p reference height — the burn (.ass with native PlayRes) and
+  /// the browser preview both scale them by actualHeight/1080, so the values
+  /// mean the same thing everywhere.
+  subtitleFontFamily   String  @default("Noto Sans")
+  subtitleFontSize     Int     @default(48)   // px @ 1080p reference
+  subtitleBold         Boolean @default(false)
+  subtitleItalic       Boolean @default(false)
+  subtitleTextColor    String  @default("#FFFFFF")  // hex #RRGGBB
+  subtitleOutlineWidth Float   @default(3)
+  subtitleOutlineColor String  @default("#000000")
+  subtitleOutlineAlpha Int     @default(80)   // 0-100 % opaque
+  subtitleShadowDepth  Float   @default(0)
+  subtitleShadowColor  String  @default("#000000")
+  subtitleBgColor      String?                 // hex #RRGGBB, null = no background box
+  subtitleBgOpacity    Int     @default(75)   // 0-100 % opaque
+  subtitleAlign        String  @default("center") // "left" | "center" | "right"
+  subtitleMarginHPct   Int     @default(4)    // L/R margin as % of width
+  subtitleLetterSpacing Float  @default(0)    // px @ 1080p reference
+  subtitlePosition  String  @default("bottom")   // legacy: kept for backwards compat, no longer read
+  /// 0 = top of frame, 100 = bottom; measured to the bottom edge of the text
+  /// block (matches ASS Alignment=2 + MarginV). Default 88 = lower-third.
   subtitlePositionPct Int   @default(88)
+  /// Dual-language ("both") mode: Chinese line size relative to the main line.
+  subtitleZhScale   Float   @default(0.8)
+  subtitleZhColor   String?                    // hex, null = same as text colour
+  /// Downscale output to 1080p before burning (big speed win on 4K sources).
+  capTo1080         Boolean @default(true)
 
   // Storage object keys (Storj). Full URLs are derived in the service layer.
   inputKey      String? // raw uploaded video
@@ -50,6 +70,16 @@ model Job {
 
   // Last error, if any.
   errorMessage  String?
+
+  /// Fine-grained progress during long phases (SYNTHESIZING/MUXING): 0-100 +
+  /// a human note, so the UI shows movement instead of a frozen spinner.
+  progress      Int?    @default(0)
+  progressNote  String?
+
+  /// Interactive AI refine runs in the background (like render) — these flag
+  /// its in-flight state so the editor can poll without blocking the request.
+  refining      Boolean @default(false)
+  refineError   String?
 
   segments      Segment[]
 
