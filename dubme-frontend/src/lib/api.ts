@@ -276,7 +276,7 @@ export interface RenderOptions {
   subtitleZhColor?: string | null;
   /** Required only when outputMode === "dub". */
   voiceName?: string;
-  ttsProvider?: "gemini" | "chimege";
+  ttsProvider?: "gemini" | "chimege" | "elevenlabs";
   stylePrompt?: string;
   temperature?: number;
 }

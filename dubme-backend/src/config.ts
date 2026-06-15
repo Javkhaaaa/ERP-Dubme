@@ -38,6 +38,11 @@ export const config = {
   geminiApiKey: required("GEMINI_API_KEY"),
   /** Optional — only required when ttsProvider="chimege" on a job. */
   chimegeTtsToken: optional("CHIMEGE_TTS_TOKEN", ""),
+  /** Optional — only required when ttsProvider="elevenlabs" on a job. */
+  elevenLabsApiKey: optional("ELEVENLABS_API_KEY", ""),
+  /** ElevenLabs model. v3 = expressive + audio tags; switch to
+   *  eleven_multilingual_v2 if v3 API access is gated on your account. */
+  elevenLabsModel: optional("ELEVENLABS_MODEL", "eleven_v3"),
 } as const;
 
 export type AppConfig = typeof config;

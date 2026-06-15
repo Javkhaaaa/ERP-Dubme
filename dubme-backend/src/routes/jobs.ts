@@ -63,7 +63,7 @@ const StartRenderSchema = z.object({
   voiceName: z.string().min(1).optional(),
   stylePrompt: z.string().optional().nullable(),
   temperature: z.number().min(0).max(2).optional(),
-  ttsProvider: z.enum(["gemini", "chimege"]).optional(),
+  ttsProvider: z.enum(["gemini", "chimege", "elevenlabs"]).optional(),
   /** "dub" replaces the audio via TTS; "subtitle" only generates subtitles. */
   outputMode: z.enum(["dub", "subtitle"]).default("dub"),
   /** Which text the subtitle shows. */

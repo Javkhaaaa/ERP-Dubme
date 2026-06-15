@@ -1,3 +1,20 @@
+/**
+ * ElevenLabs voices (pre-made library voice IDs — exist on every account).
+ * NOTE: Mongolian is not officially supported by ElevenLabs TTS; v3 will
+ * attempt it but quality varies — test before relying on it. You can also
+ * paste a custom/cloned voice ID.
+ */
+export const ELEVENLABS_VOICES: { value: string; label: string }[] = [
+  { value: "21m00Tcm4TlvDq8ikWAM", label: "Rachel (эмэгтэй, тайван) ⭐" },
+  { value: "EXAVITQu4vr4xnSDxMaL", label: "Bella (эмэгтэй, зөөлөн)" },
+  { value: "AZnzlk1XvdvUeBnXmlld", label: "Domi (эмэгтэй, эрч хүчтэй)" },
+  { value: "MF3mGyEYCl7XYWbV9V6O", label: "Elli (эмэгтэй, залуу)" },
+  { value: "pNInz6obpgDQGcFmaJgB", label: "Adam (эрэгтэй, гүн)" },
+  { value: "ErXwobaYiN019PkySvjV", label: "Antoni (эрэгтэй, дулаан)" },
+  { value: "TxGEqnHWrfWFTfGW9XjX", label: "Josh (эрэгтэй, залуу)" },
+  { value: "VR6AewLTigWG4xSOukaG", label: "Arnold (эрэгтэй, хатуу)" },
+];
+
 /** Chimege /synthesize voices — Mongolian-native, single-speaker model. */
 export const CHIMEGE_VOICES: { value: string; label: string }[] = [
   { value: "FEMALE3v2", label: "FEMALE3v2 (эмэгтэй, дулаан) ⭐" },

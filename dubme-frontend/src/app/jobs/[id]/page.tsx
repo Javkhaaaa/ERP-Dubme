@@ -20,7 +20,7 @@ import {
   type SubtitleAlign,
   type SubtitleText,
 } from "@/lib/api";
-import { CHIMEGE_VOICES, GEMINI_VOICES } from "@/lib/voices";
+import { CHIMEGE_VOICES, ELEVENLABS_VOICES, GEMINI_VOICES } from "@/lib/voices";
 
 const PIPELINE_STEPS: { id: JobStatus; label: string }[] = [
   { id: "UPLOADED", label: "Орлоо" },
@@ -177,7 +177,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const { id } = params;
   const [job, setJob] = useState<Job | null>(null);
   const [segments, setSegments] = useState<Segment[]>([]);
-  const [ttsProvider, setTtsProvider] = useState<"gemini" | "chimege">("chimege");
+  const [ttsProvider, setTtsProvider] = useState<"gemini" | "chimege" | "elevenlabs">("chimege");
   const [voice, setVoice] = useState("FEMALE3v2");
   const [stylePrompt, setStylePrompt] = useState("");
   const [outputMode, setOutputMode] = useState<OutputMode>("dub");
@@ -428,9 +428,15 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   };
 
-  const onTtsProviderChange = (p: "gemini" | "chimege") => {
+  const onTtsProviderChange = (p: "gemini" | "chimege" | "elevenlabs") => {
     setTtsProvider(p);
-    setVoice(p === "chimege" ? "FEMALE3v2" : "Kore");
+    setVoice(
+      p === "chimege"
+        ? "FEMALE3v2"
+        : p === "elevenlabs"
+          ? ELEVENLABS_VOICES[0].value
+          : "Kore",
+    );
   };
 
   const loadSegmentAudio = async (segId: string) => {
@@ -759,8 +765,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
                   <>
                     <label>
                       <span>TTS engine</span>
-                      <select value={ttsProvider} onChange={(e) => onTtsProviderChange(e.target.value as "gemini" | "chimege")}>
+                      <select value={ttsProvider} onChange={(e) => onTtsProviderChange(e.target.value as "gemini" | "chimege" | "elevenlabs")}>
                         <option value="chimege">Chimege (монгол, чанартай) ⭐</option>
+                        <option value="elevenlabs">ElevenLabs (илэрхийлэлтэй — туршилт)</option>
                         <option value="gemini">Gemini Flash TTS</option>
                       </select>
                     </label>
@@ -768,11 +775,22 @@ export default function JobPage({ params }: { params: { id: string } }) {
                     <label>
                       <span>Хоолой</span>
                       <select value={voice} onChange={(e) => setVoice(e.target.value)}>
-                        {(ttsProvider === "chimege" ? CHIMEGE_VOICES : GEMINI_VOICES).map((v) => (
+                        {(ttsProvider === "chimege"
+                          ? CHIMEGE_VOICES
+                          : ttsProvider === "elevenlabs"
+                            ? ELEVENLABS_VOICES
+                            : GEMINI_VOICES
+                        ).map((v) => (
                           <option key={v.value} value={v.value}>{v.label}</option>
                         ))}
                       </select>
                     </label>
+
+                    {ttsProvider === "elevenlabs" && (
+                      <p className="card-subtitle" style={{ marginTop: "-0.25rem", fontSize: "0.78rem", padding: "0.5rem 0.75rem", background: "rgba(255,200,0,0.08)", border: "1px solid rgba(255,200,0,0.3)", borderRadius: 4 }}>
+                        ⚠️ ElevenLabs монгол хэлийг албан ёсоор дэмждэггүй — v3 уншихыг оролдоно, чанар тогтворгүй байж болзошгүй. Эх жүжигчний сэтгэл хөдлөлийг (emotion) audio tag болгон ашиглана. Туршилтаар сонсож шалгана уу.
+                      </p>
+                    )}
 
                     {ttsProvider === "gemini" && (
                       <label>

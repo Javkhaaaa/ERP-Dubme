@@ -39,6 +39,7 @@ import {
 import { translateSegments } from "./clients/gemini-translate.js";
 import { synthesize as synthesizeGemini } from "./clients/gemini-tts.js";
 import { synthesizeChimege } from "./clients/chimege-tts.js";
+import { synthesizeElevenLabs } from "./clients/elevenlabs-tts.js";
 
 /**
  * The full dubme pipeline:
@@ -498,8 +499,14 @@ export async function runRender(jobId: string): Promise<void> {
 
   const ttsProvider = job.ttsProvider ?? "gemini";
   const isChimege = ttsProvider === "chimege";
+  const isElevenLabs = ttsProvider === "elevenlabs";
+  // Per-provider request-length cap + safe concurrency.
+  //   • Chimege  — hard 300-char server cap → 280; generous rate limit → 6
+  //   • Gemini   — ~600-char truncation; RPM-bound preview → 3
+  //   • ElevenLabs — handles longer text, but account concurrency is limited
+  //     (free ~2, paid ~3-5) → 3; keep groups ~600 for tight A/V sync
   const maxChars = isChimege ? 280 : 600;
-  const ttsConcurrency = isChimege ? 6 : 3; // Gemini TTS preview is RPM-bound
+  const ttsConcurrency = isChimege ? 6 : 3;
 
   const groups = groupForSynthesis(segments, { maxGapSec: 1.0, maxChars });
   console.log(
@@ -518,12 +525,20 @@ export async function runRender(jobId: string): Promise<void> {
       const combinedText = group.segments.map((s) => s.translatedText!.trim()).join(" ");
       const wav = isChimege
         ? await synthesizeChimege({ text: combinedText, voiceId: job.voiceName! })
-        : await synthesizeGemini({
-            text: combinedText,
-            voiceName: job.voiceName!,
-            stylePrompt: job.stylePrompt ?? undefined,
-            temperature: job.temperature ?? undefined,
-          });
+        : isElevenLabs
+          ? await synthesizeElevenLabs({
+              text: combinedText,
+              voiceId: job.voiceName!,
+              // Drive Eleven v3's expressive audio tags from the detected
+              // emotion of the group's first segment.
+              emotion: group.segments[0].emotion,
+            })
+          : await synthesizeGemini({
+              text: combinedText,
+              voiceName: job.voiceName!,
+              stylePrompt: job.stylePrompt ?? undefined,
+              temperature: job.temperature ?? undefined,
+            });
       const localPath = tmpPath("wav");
       tempPaths.push(localPath);
       await writeFile(localPath, wav);
@@ -753,6 +768,7 @@ interface SynthesisGroup {
     startSec: number;
     endSec: number;
     translatedText: string | null;
+    emotion?: string | null;
   }[];
 }
 
@@ -768,6 +784,7 @@ function groupForSynthesis(
     startSec: number;
     endSec: number;
     translatedText: string | null;
+    emotion?: string | null;
   }[],
   opts: { maxGapSec: number; maxChars: number },
 ): SynthesisGroup[] {
