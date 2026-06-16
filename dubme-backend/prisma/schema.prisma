@@ -15,6 +15,8 @@ datasource db {
 model Job {
   id              String    @id @default(uuid())
   status          JobStatus @default(UPLOADED)
+  /// Optional human-friendly name for the job (editable any time).
+  name            String?
   sourceLanguage  String    @default("zh") // ISO 639-1
   targetLanguage  String    @default("mn")
   /// Which TTS engine to use: "gemini" or "chimege"

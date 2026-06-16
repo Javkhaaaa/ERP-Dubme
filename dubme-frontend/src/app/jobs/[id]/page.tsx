@@ -10,6 +10,7 @@ import {
   getSegments,
   jobSrtDownloadUrl,
   refineTranslations,
+  renameJob,
   startRender,
   SUBTITLE_REF_HEIGHT,
   updateSegment,
@@ -203,6 +204,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const [downloads, setDownloads] = useState<{ output?: string; subtitle?: string }>({});
   const [previews, setPreviews] = useState<{ input?: string; output?: string }>({});
   const [busy, setBusy] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [showScrollTop, setShowScrollTop] = useState(false);
   const [segmentAudio, setSegmentAudio] = useState<Record<string, string>>({});
 
   const segmentsLoadedRef = useRef(false);
@@ -449,6 +453,29 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   };
 
+  const beginEditName = () => {
+    setNameDraft(job?.name ?? "");
+    setEditingName(true);
+  };
+  const saveName = async () => {
+    const next = nameDraft.trim();
+    setEditingName(false);
+    try {
+      const updated = await renameJob(id, next || null);
+      setJob((prev) => (prev ? { ...prev, name: updated.name } : prev));
+    } catch (err) {
+      console.error("rename failed:", err);
+    }
+  };
+
+  // Show a "scroll to top" button once the (long) editing page is scrolled.
+  useEffect(() => {
+    const onScroll = () => setShowScrollTop(window.scrollY > 600);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
   if (!job) {
     return (
       <main className="shell">
@@ -475,10 +502,36 @@ export default function JobPage({ params }: { params: { id: string } }) {
         <section className="card">
           <div className="row" style={{ justifyContent: "space-between", marginBottom: "0.75rem" }}>
             <div>
-              <h2 className="card-title" style={{ marginBottom: "0.25rem" }}>
-                Job · <span style={{ fontFamily: "ui-monospace" }}>{id.slice(0, 8)}</span>
-              </h2>
+              {editingName ? (
+                <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", marginBottom: "0.25rem" }}>
+                  <input
+                    autoFocus
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") saveName();
+                      if (e.key === "Escape") setEditingName(false);
+                    }}
+                    maxLength={200}
+                    placeholder={`Job · ${id.slice(0, 8)}`}
+                    style={{ fontSize: "1rem", padding: "0.35rem 0.55rem", maxWidth: 340, width: "60vw" }}
+                  />
+                  <button type="button" onClick={saveName} title="Хадгалах"
+                    style={{ padding: "0.35rem 0.6rem", fontSize: "0.85rem", border: "1px solid var(--border)", borderRadius: 6, background: "rgba(124,92,255,0.2)", color: "var(--text)", cursor: "pointer", boxShadow: "none" }}>✓</button>
+                  <button type="button" onClick={() => setEditingName(false)} title="Болих"
+                    style={{ padding: "0.35rem 0.55rem", fontSize: "0.85rem", border: "1px solid var(--border)", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", boxShadow: "none" }}>✕</button>
+                </div>
+              ) : (
+                <h2 className="card-title" style={{ marginBottom: "0.25rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <span style={job.name ? undefined : { fontFamily: "ui-monospace" }}>
+                    {job.name || `Job · ${id.slice(0, 8)}`}
+                  </span>
+                  <button type="button" onClick={beginEditName} title="Нэр засах"
+                    style={{ background: "transparent", border: "none", cursor: "pointer", color: "var(--text-muted)", fontSize: "0.85rem", padding: 2, lineHeight: 1 }}>✏️</button>
+                </h2>
+              )}
               <p className="muted" style={{ margin: 0 }}>
+                {job.name ? `${id.slice(0, 8)} · ` : ""}
                 {new Date(job.createdAt).toLocaleString()}
               </p>
             </div>
@@ -853,6 +906,36 @@ export default function JobPage({ params }: { params: { id: string } }) {
           </section>
         )}
       </main>
+
+      {showScrollTop && (
+        <button
+          type="button"
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          title="Дээш очих"
+          aria-label="Дээш очих"
+          style={{
+            position: "fixed",
+            right: "1.5rem",
+            bottom: "1.5rem",
+            zIndex: 50,
+            width: 48,
+            height: 48,
+            borderRadius: "50%",
+            border: "1px solid var(--border-strong)",
+            background: "var(--bg-elevated)",
+            backdropFilter: "blur(8px)",
+            color: "var(--text)",
+            fontSize: "1.25rem",
+            cursor: "pointer",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          ↑
+        </button>
+      )}
     </>
   );
 }

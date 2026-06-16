@@ -19,18 +19,21 @@ import { formatSrtTime } from "../ffmpeg.js";
 const CreateJobSchema = z.object({
   sourceLanguage: z.string().default("zh"),
   targetLanguage: z.string().default("mn"),
+  name: z.string().trim().max(200).optional(),
   filename: z.string(), // original client filename, used for content-type heuristics
 });
 
 const CreateJobFromUrlSchema = z.object({
   sourceLanguage: z.string().default("zh"),
   targetLanguage: z.string().default("mn"),
+  name: z.string().trim().max(200).optional(),
   url: z.string().url(),
 });
 
 const CreateJobFromSrtSchema = z.object({
   sourceLanguage: z.string().default("zh"),
   targetLanguage: z.string().default("mn"),
+  name: z.string().trim().max(200).optional(),
   videoUrl: z.string().url(),
   srtContent: z.string().min(10).max(5_000_000),
 });
@@ -38,6 +41,7 @@ const CreateJobFromSrtSchema = z.object({
 const CreateJobFromSrtUploadSchema = z.object({
   sourceLanguage: z.string().default("zh"),
   targetLanguage: z.string().default("mn"),
+  name: z.string().trim().max(200).optional(),
   filename: z.string(),
   srtContent: z.string().min(10).max(5_000_000),
 });
@@ -45,6 +49,7 @@ const CreateJobFromSrtUploadSchema = z.object({
 const CreateJobFromSrtOnlySchema = z.object({
   sourceLanguage: z.string().default("zh"),
   targetLanguage: z.string().default("mn"),
+  name: z.string().trim().max(200).optional(),
   srtContent: z.string().min(10).max(5_000_000),
 });
 
@@ -112,6 +117,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       data: {
         sourceLanguage: body.sourceLanguage,
         targetLanguage: body.targetLanguage,
+        name: body.name,
       },
     });
 
@@ -145,6 +151,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       data: {
         sourceLanguage: body.sourceLanguage,
         targetLanguage: body.targetLanguage,
+        name: body.name,
       },
     });
 
@@ -182,6 +189,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       data: {
         sourceLanguage: body.sourceLanguage,
         targetLanguage: body.targetLanguage,
+        name: body.name,
       },
     });
 
@@ -229,6 +237,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       data: {
         sourceLanguage: body.sourceLanguage,
         targetLanguage: body.targetLanguage,
+        name: body.name,
       },
     });
 
@@ -279,6 +288,7 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
       data: {
         sourceLanguage: body.sourceLanguage,
         targetLanguage: body.targetLanguage,
+        name: body.name,
         // inputKey intentionally left null — render is not applicable.
       },
     });
@@ -343,6 +353,20 @@ export async function registerJobRoutes(app: FastifyInstance): Promise<void> {
     });
     if (!job) return reply.code(404).send({ error: "Not found" });
     return job;
+  });
+
+  /** 3b. Rename a job (set/edit its human-friendly name, any time). */
+  app.patch("/jobs/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = z
+      .object({ name: z.string().trim().max(200).nullable() })
+      .parse(request.body);
+    const job = await prisma.job.findUnique({ where: { id } });
+    if (!job) return reply.code(404).send({ error: "Job not found" });
+    return prisma.job.update({
+      where: { id },
+      data: { name: body.name && body.name.length > 0 ? body.name : null },
+    });
   });
 
   /** 4. After auto-translation, the editor fetches the segments. */

@@ -90,6 +90,7 @@ export default function Home() {
   const [srtVideoFile, setSrtVideoFile] = useState<File | null>(null);
 
   // common
+  const [jobName, setJobName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -113,12 +114,14 @@ export default function Home() {
     setError("");
     setBusy(true);
     setUploadPct(0);
+    const name = jobName.trim() || undefined;
     try {
       if (mode === "upload") {
         if (!file) throw new Error("Файл сонгоно уу");
         const { jobId, uploadUrl, contentType } = await createJob(
           file.name,
           sourceLanguage,
+          name,
         );
         await uploadToS3(uploadUrl, file, contentType, setUploadPct);
         await startJob(jobId);
@@ -128,11 +131,12 @@ export default function Home() {
         const { jobId } = await createJobFromUrl(
           videoUrl.trim(),
           sourceLanguage,
+          name,
         );
         router.push(`/jobs/${jobId}`);
       } else if (mode === "srt-only") {
         if (!srtContent.trim()) throw new Error("SRT файл оруулна уу");
-        const { jobId } = await createJobFromSrtOnly(srtContent, sourceLanguage);
+        const { jobId } = await createJobFromSrtOnly(srtContent, sourceLanguage, name);
         router.push(`/jobs/${jobId}`);
       } else {
         if (!srtContent.trim()) throw new Error("SRT файлаа оруулна уу");
@@ -142,6 +146,7 @@ export default function Home() {
             videoUrl.trim(),
             srtContent,
             sourceLanguage,
+            name,
           );
           router.push(`/jobs/${jobId}`);
         } else {
@@ -151,6 +156,7 @@ export default function Home() {
               srtVideoFile.name,
               srtContent,
               sourceLanguage,
+              name,
             );
           await uploadToS3(uploadUrl, srtVideoFile, contentType, setUploadPct);
           await startJob(jobId);
@@ -221,6 +227,25 @@ export default function Home() {
           <p className="card-subtitle">
             {TABS.find((t) => t.id === mode)?.sub}
           </p>
+
+          {/* Job name (optional) */}
+          <label style={{ marginBottom: "1rem" }}>
+            <span>Нэр (заавал биш)</span>
+            <input
+              type="text"
+              value={jobName}
+              onChange={(e) => setJobName(e.target.value)}
+              disabled={busy}
+              maxLength={200}
+              placeholder="Жишээ нь: Хүннү эзэнт гүрэн — 3-р анги"
+            />
+            <span
+              className="muted"
+              style={{ display: "block", fontSize: "0.75rem", marginTop: "0.4rem" }}
+            >
+              Ажлаа танихад хялбар болгох нэр. Дараа нь засаж болно.
+            </span>
+          </label>
 
           {/* Source language */}
           <label style={{ marginBottom: "1rem" }}>
@@ -629,12 +654,12 @@ export default function Home() {
                   <div>
                     <div
                       style={{
-                        fontFamily: "ui-monospace, monospace",
-                        fontSize: "0.85rem",
-                        fontWeight: 500,
+                        fontSize: "0.9rem",
+                        fontWeight: 600,
+                        fontFamily: j.name ? "inherit" : "ui-monospace, monospace",
                       }}
                     >
-                      {j.id.slice(0, 8)}
+                      {j.name || j.id.slice(0, 8)}
                     </div>
                     <div className="muted" style={{ fontSize: "0.75rem", marginTop: "0.15rem" }}>
                       {new Date(j.createdAt).toLocaleString()} ·{" "}

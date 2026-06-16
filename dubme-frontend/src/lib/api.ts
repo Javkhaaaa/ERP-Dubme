@@ -27,6 +27,7 @@ export const SUBTITLE_REF_HEIGHT = 1080;
 export interface Job {
   id: string;
   status: JobStatus;
+  name: string | null;
   sourceLanguage: string;
   targetLanguage: string;
   voiceName: string | null;
@@ -101,6 +102,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export async function createJob(
   filename: string,
   sourceLanguage = "zh",
+  name?: string,
 ): Promise<{
   jobId: string;
   uploadUrl: string;
@@ -109,7 +111,7 @@ export async function createJob(
 }> {
   return api("/api/jobs", {
     method: "POST",
-    body: JSON.stringify({ filename, sourceLanguage }),
+    body: JSON.stringify({ filename, sourceLanguage, name }),
   });
 }
 
@@ -149,10 +151,11 @@ export async function startJob(jobId: string): Promise<void> {
 export async function createJobFromUrl(
   url: string,
   sourceLanguage = "zh",
+  name?: string,
 ): Promise<{ jobId: string }> {
   return api("/api/jobs/from-url", {
     method: "POST",
-    body: JSON.stringify({ url, sourceLanguage }),
+    body: JSON.stringify({ url, sourceLanguage, name }),
   });
 }
 
@@ -164,10 +167,11 @@ export async function createJobFromSrt(
   videoUrl: string,
   srtContent: string,
   sourceLanguage = "zh",
+  name?: string,
 ): Promise<{ jobId: string; segmentCount: number }> {
   return api("/api/jobs/from-srt", {
     method: "POST",
-    body: JSON.stringify({ videoUrl, srtContent, sourceLanguage }),
+    body: JSON.stringify({ videoUrl, srtContent, sourceLanguage, name }),
   });
 }
 
@@ -181,6 +185,7 @@ export async function createJobFromSrtUpload(
   filename: string,
   srtContent: string,
   sourceLanguage = "zh",
+  name?: string,
 ): Promise<{
   jobId: string;
   uploadUrl: string;
@@ -190,7 +195,7 @@ export async function createJobFromSrtUpload(
 }> {
   return api("/api/jobs/from-srt-upload", {
     method: "POST",
-    body: JSON.stringify({ filename, srtContent, sourceLanguage }),
+    body: JSON.stringify({ filename, srtContent, sourceLanguage, name }),
   });
 }
 
@@ -203,15 +208,24 @@ export async function createJobFromSrtUpload(
 export async function createJobFromSrtOnly(
   srtContent: string,
   sourceLanguage = "zh",
+  name?: string,
 ): Promise<{ jobId: string; segmentCount: number }> {
   return api("/api/jobs/from-srt-only", {
     method: "POST",
-    body: JSON.stringify({ srtContent, sourceLanguage }),
+    body: JSON.stringify({ srtContent, sourceLanguage, name }),
   });
 }
 
 export async function getJob(jobId: string): Promise<Job> {
   return api(`/api/jobs/${jobId}`);
+}
+
+/** Set/edit a job's human-friendly name (pass "" or null to clear). */
+export async function renameJob(jobId: string, name: string | null): Promise<Job> {
+  return api(`/api/jobs/${jobId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
 }
 
 export async function getSegments(jobId: string): Promise<Segment[]> {
